@@ -1,0 +1,322 @@
+#!/bin/bash
+#
+#  File: afl-cov
+#
+#  Version: 1.0.0
+#
+#  Purpose: Generate LLVM source-based code coverage reports from AFL++ corpus.
+#           Replays queue/crash/timeout files through a coverage-instrumented
+#           binary, merges .profraw profiles, and produces HTML/text/JSON
+#           reports via llvm-profdata and llvm-cov.
+#
+#  Copyright (c) 2026 by Marc "vanHauser" Heuse (vh@thc.org)
+#
+#  License: GNU Affero General Public License 3.0 or any later version)
+#
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# ── defaults ──────────────────────────────────────────────────────────────────
+
+AFL_DIR=""
+COVERAGE_CMD=""
+REPORT_DIR=""
+TIMEOUT=5
+VERBOSE=0
+QUIET=0
+IGNORE_REGEX='/usr/include/'
+PROFRAW_DIR=""
+LLVM_PROFDATA=""
+LLVM_COV=""
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+log()  { test "$QUIET" -eq 0 && echo "[+] $*" || true; }
+logv() { test "$VERBOSE" -eq 1 && echo "[*] $*" || true; }
+err()  { echo "[-] $*" >&2; }
+
+usage() {
+  cat << 'EOF'
+Usage: afl-cov [options]
+
+Required:
+  -d <dir>    AFL++ fuzzing output directory
+  -e <cmd>    Coverage command. Use @@ as input file placeholder.
+              Omit @@ to feed input via stdin instead.
+
+Optional:
+  -o <dir>           Report output directory (default: <afl-dir>/cov)
+  -T <secs>          Timeout in seconds for crash/timeout replay (default: 5)
+  --ignore-regex <r> Filename regex to exclude from llvm-cov reports
+                     (default: /usr/include/)
+  -v                 Verbose output
+  -q                 Quiet mode (suppress all [+] output)
+  -V                 Print version and exit
+  -h, --help         Print this help and exit
+
+Examples:
+  # Standard replay with file-based input
+  afl-cov -d out -e "./cov @@"
+
+  # With env vars, custom report dir, 10s timeout
+  afl-cov -d out -e "LD_LIBRARY_PATH=./lib ./cov @@" -o coverage -T 10
+
+  # stdin input (binary reads from stdin)
+  afl-cov -d out -e "./cov"
+
+  # Exclude test files and system headers from report
+  afl-cov -d out -e "./cov @@" --ignore-regex '(/usr/include/|/test/)'
+EOF
+}
+
+# Find an LLVM tool by bare name, then versioned (20 down to 11)
+find_tool() {
+  local tool="$1"
+  if command -v "$tool" >/dev/null 2>&1; then
+    echo "$tool"
+    return 0
+  fi
+  for ver in 20 19 18 17 16 15 14 13 12 11; do
+    if command -v "${tool}-${ver}" >/dev/null 2>&1; then
+      echo "${tool}-${ver}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Extract the instrumented binary path from a coverage command string.
+# Skips leading KEY=VALUE env assignments and @@ placeholders.
+extract_binary() {
+  local cmd="$1"
+  local token
+  for token in $cmd; do
+    case "$token" in
+      *=*|@@) continue ;;
+      *)      echo "$token"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Emit null-delimited queue file paths across single and parallel AFL dirs.
+find_queue_files() {
+  find "$AFL_DIR/queue" "$AFL_DIR"/*/queue \
+    -name 'id:*' -print0 2>/dev/null || true
+}
+
+# Emit null-delimited crash/timeout file paths across all AFL dirs.
+find_crash_timeout_files() {
+  find "$AFL_DIR/crashes" "$AFL_DIR"/*/crashes \
+       "$AFL_DIR/timeouts" "$AFL_DIR"/*/timeouts \
+    -name 'id:*' -print0 2>/dev/null || true
+}
+
+# Count null-delimited records from a file-list function
+count_files() {
+  "$@" | tr -cd '\0' | wc -c
+}
+
+# ── argument parsing ──────────────────────────────────────────────────────────
+
+test $# -eq 0 && { usage; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -d)            AFL_DIR="$2";       shift 2 ;;
+    -e)            COVERAGE_CMD="$2";  shift 2 ;;
+    -o)            REPORT_DIR="$2";    shift 2 ;;
+    -T)            TIMEOUT="$2";       shift 2 ;;
+    -v)            VERBOSE=1;          shift   ;;
+    -q)            QUIET=1;            shift   ;;
+    -V)            echo "afl-cov-$VERSION"; exit 0 ;;
+    -h|--help)     usage; exit 0 ;;
+    --ignore-regex) IGNORE_REGEX="$2"; shift 2 ;;
+    *) err "Unknown option: $1"; echo "" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+# ── validate inputs ───────────────────────────────────────────────────────────
+
+if test -z "$AFL_DIR"; then
+  err "Must specify AFL fuzzing dir with -d"
+  exit 1
+fi
+if test -z "$COVERAGE_CMD"; then
+  err "Must specify coverage command with -e"
+  exit 1
+fi
+if ! test -d "$AFL_DIR"; then
+  err "AFL directory does not exist: $AFL_DIR"
+  exit 1
+fi
+
+COV_BINARY="$(extract_binary "$COVERAGE_CMD")"
+if test -z "$COV_BINARY"; then
+  err "Could not extract binary path from coverage command: $COVERAGE_CMD"
+  exit 1
+fi
+if ! test -x "$COV_BINARY"; then
+  err "Coverage binary not found or not executable: $COV_BINARY"
+  exit 1
+fi
+logv "Coverage binary: $COV_BINARY"
+logv "Coverage command: $COVERAGE_CMD"
+
+test -z "$REPORT_DIR" && REPORT_DIR="$AFL_DIR/cov"
+
+# ── detect LLVM tools ─────────────────────────────────────────────────────────
+
+LLVM_PROFDATA="$(find_tool llvm-profdata)" || {
+  err "llvm-profdata not found. Install LLVM (apt install llvm / dnf install llvm)."
+  exit 1
+}
+LLVM_COV="$(find_tool llvm-cov)" || {
+  err "llvm-cov not found. Install LLVM (apt install llvm / dnf install llvm)."
+  exit 1
+}
+log "LLVM tools: $LLVM_PROFDATA, $LLVM_COV"
+
+# ── prepare workspace ─────────────────────────────────────────────────────────
+
+PROFRAW_DIR="$(mktemp -d /tmp/afl-cov-profraw.XXXXXX)"
+trap 'rm -rf "$PROFRAW_DIR"' EXIT INT TERM
+
+mkdir -p "$REPORT_DIR/html" "$REPORT_DIR/text"
+export LLVM_PROFILE_FILE="$PROFRAW_DIR/cov-%p.profraw"
+
+log "AFL directory  : $AFL_DIR"
+log "Report directory: $REPORT_DIR"
+logv "Profraw temp dir: $PROFRAW_DIR"
+
+# ── replay queue files ────────────────────────────────────────────────────────
+
+QUEUE_COUNT=$(count_files find_queue_files)
+log "Replaying $QUEUE_COUNT queue files..."
+
+if echo "$COVERAGE_CMD" | grep -q '@@'; then
+  # Determine if @@ is the last token (enables fast batch mode)
+  LAST_TOKEN="${COVERAGE_CMD##* }"
+  if test "$LAST_TOKEN" = "@@"; then
+    # Fast batch: strip trailing @@ and let xargs append all files at once.
+    # sh -c handles env assignments (e.g. LD_LIBRARY_PATH=./lib ./cov) correctly.
+    CMD_NO_AT="${COVERAGE_CMD% @@}"
+    logv "Queue replay: batch (xargs)"
+    # shellcheck disable=SC2016
+    find_queue_files | xargs -0 sh -c "${CMD_NO_AT}"' "$@"' -- >/dev/null 2>&1 || true
+  else
+    # @@ is embedded mid-command (e.g. "./cov -f @@ -extra") — loop mode
+    logv "Queue replay: loop (mid-command @@)"
+    while IFS= read -r -d '' f; do
+      logv "  $f"
+      CMD="${COVERAGE_CMD/@@/$f}"
+      sh -c "$CMD" >/dev/null 2>&1 || true
+    done < <(find_queue_files)
+  fi
+else
+  # No @@ — feed each file via stdin
+  logv "Queue replay: stdin loop"
+  while IFS= read -r -d '' f; do
+    logv "  $f"
+    sh -c "$COVERAGE_CMD" < "$f" >/dev/null 2>&1 || true
+  done < <(find_queue_files)
+fi
+
+# ── replay crashes and timeouts ───────────────────────────────────────────────
+
+CRASH_COUNT=$(count_files find_crash_timeout_files)
+if test "$CRASH_COUNT" -gt 0; then
+  log "Replaying $CRASH_COUNT crash/timeout files (timeout=${TIMEOUT}s each)..."
+  while IFS= read -r -d '' f; do
+    logv "  $f"
+    if echo "$COVERAGE_CMD" | grep -q '@@'; then
+      CMD="${COVERAGE_CMD/@@/$f}"
+      timeout --signal=SIGTERM "${TIMEOUT}s" sh -c "$CMD" >/dev/null 2>&1 || true
+    else
+      timeout --signal=SIGTERM "${TIMEOUT}s" sh -c "$COVERAGE_CMD" < "$f" >/dev/null 2>&1 || true
+    fi
+  done < <(find_crash_timeout_files)
+fi
+
+# ── check profraw files were generated ───────────────────────────────────────
+
+PROFRAW_COUNT=$(find "$PROFRAW_DIR" -name '*.profraw' 2>/dev/null | wc -l)
+if test "$PROFRAW_COUNT" -eq 0; then
+  err "No .profraw files generated."
+  err "Check that the binary is instrumented with -fprofile-instr-generate."
+  err "Use afl-cov-build.sh to build the coverage binary."
+  exit 1
+fi
+logv "Generated $PROFRAW_COUNT .profraw file(s)"
+
+# ── merge profiles ────────────────────────────────────────────────────────────
+
+log "Merging $PROFRAW_COUNT profile(s)..."
+"$LLVM_PROFDATA" merge -sparse "$PROFRAW_DIR"/cov-*.profraw \
+  -o "$REPORT_DIR/coverage.profdata" || {
+  err "llvm-profdata merge failed"
+  exit 1
+}
+
+# ── generate reports ──────────────────────────────────────────────────────────
+
+# Common options for llvm-cov show
+SHOW_OPTS=(
+  "$COV_BINARY"
+  "-instr-profile=$REPORT_DIR/coverage.profdata"
+  "-show-directory-coverage"
+  "-show-line-counts-or-regions"
+  "-show-branches=count"
+  "-ignore-filename-regex=$IGNORE_REGEX"
+)
+
+log "Generating HTML report..."
+"$LLVM_COV" show "${SHOW_OPTS[@]}" \
+  -format=html \
+  -output-dir="$REPORT_DIR/html" || {
+  err "llvm-cov show (HTML) failed"
+  exit 1
+}
+
+log "Generating text report..."
+"$LLVM_COV" show "${SHOW_OPTS[@]}" \
+  -format=text \
+  -output-dir="$REPORT_DIR/text" || {
+  err "llvm-cov show (text) failed"
+  exit 1
+}
+
+log "Generating summary..."
+"$LLVM_COV" report "$COV_BINARY" \
+  "-instr-profile=$REPORT_DIR/coverage.profdata" \
+  "-ignore-filename-regex=$IGNORE_REGEX" \
+  > "$REPORT_DIR/summary.txt" || {
+  err "llvm-cov report failed"
+  exit 1
+}
+
+log "Generating JSON export..."
+"$LLVM_COV" export "$COV_BINARY" \
+  --format=text \
+  "-instr-profile=$REPORT_DIR/coverage.profdata" \
+  "-ignore-filename-regex=$IGNORE_REGEX" \
+  > "$REPORT_DIR/coverage.json" || {
+  err "llvm-cov export failed"
+  exit 1
+}
+
+# ── print summary ─────────────────────────────────────────────────────────────
+
+if test "$QUIET" -eq 0; then
+  echo ""
+  echo "=== Coverage Summary ==="
+  cat "$REPORT_DIR/summary.txt"
+  echo ""
+  echo "[+] HTML report  : file://$REPORT_DIR/html/index.html"
+  echo "[+] Text report  : $REPORT_DIR/text/"
+  echo "[+] Summary      : $REPORT_DIR/summary.txt"
+  echo "[+] JSON export  : $REPORT_DIR/coverage.json"
+  echo "[+] Profile data : $REPORT_DIR/coverage.profdata"
+fi
