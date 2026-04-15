@@ -98,11 +98,28 @@ find_queue_files() {
   esac
 }
 
-# Emit null-delimited crash/timeout file paths across all AFL dirs.
+# Emit null-delimited crash/timeout file paths for the detected layout.
+# Reads globals: AFL_DIR, FUZZER_LAYOUT
 find_crash_timeout_files() {
-  find "$AFL_DIR/crashes" "$AFL_DIR"/*/crashes \
-       "$AFL_DIR/timeouts" "$AFL_DIR"/*/timeouts \
-    -name 'id:*' -print0 2>/dev/null || true
+  case "${FUZZER_LAYOUT:-afl}" in
+    afl)
+      find "$AFL_DIR/crashes" "$AFL_DIR"/*/crashes \
+           "$AFL_DIR/timeouts" "$AFL_DIR"/*/timeouts \
+        -name 'id:*' -print0 2>/dev/null || true
+      ;;
+    flat)
+      # libFuzzer artifacts (crash-*/leak-*/oom-*/timeout-*/slow-unit-*)
+      # and honggfuzz crash files (SIG*.fuzz).
+      find "$AFL_DIR" -maxdepth 1 -type f \
+        \( -name 'crash-*' \
+           -o -name 'leak-*' \
+           -o -name 'oom-*' \
+           -o -name 'timeout-*' \
+           -o -name 'slow-unit-*' \
+           -o -name 'SIG*.fuzz' \) \
+        -print0 2>/dev/null || true
+      ;;
+  esac
 }
 
 # Count null-delimited records from a file-list function
