@@ -431,12 +431,14 @@ cmd_stability() {
 # ── command: diff ────────────────────────────────────────────────────────────
 
 cmd_diff() {
+  local REPORT_DIR="."
   case "${1-}" in
+    -o)        REPORT_DIR="$2"; shift 2 ;;
     -h|--help) usage_diff; exit 0 ;;
     -V)        echo "afl-cov-$VERSION"; exit 0 ;;
   esac
-  OLD="$1"
-  NEW="$2"
+  local OLD="${1-}"
+  local NEW="${2-}"
   test -z "$OLD" && OLD="$REPORT_DIR/coverage_old.json"
   test -z "$NEW" && NEW="$REPORT_DIR/coverage.json"
   test -s "$OLD" || { err "The old JSON report does not exist: $OLD"; exit 1; }
@@ -992,7 +994,7 @@ cmd_report() {
 
   # ── prepare workspace ──────────────────────────────────────────────────────
   PROFRAW_DIR="$(mktemp -d /tmp/afl-cov-profraw.XXXXXX)"
-  trap 'rm -rf "$PROFRAW_DIR"' EXIT INT TERM
+  trap "rm -rf '$PROFRAW_DIR'" EXIT INT TERM
 
   rm -rf "$REPORT_DIR/html" "$REPORT_DIR/text"
   mkdir -p "$REPORT_DIR/html" "$REPORT_DIR/text"
@@ -1143,9 +1145,11 @@ cmd_report() {
   # ── print summary ──────────────────────────────────────────────────────────
   if test "$QUIET" -eq 0; then
     echo ""
-    echo "=== Coverage Summary ==="
-    cat "$REPORT_DIR/summary.txt"
-    echo ""
+    if test "$VERBOSE" -eq 1; then
+      echo "=== Coverage Summary ==="
+      cat "$REPORT_DIR/summary.txt"
+      echo ""
+    fi
     echo "[+] HTML report  : file://$REPORT_DIR/html/index.html"
     echo "[+] Text report  : $REPORT_DIR/text/"
     echo "[+] Summary      : $REPORT_DIR/summary.txt"
