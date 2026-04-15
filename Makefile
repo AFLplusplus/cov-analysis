@@ -2,7 +2,7 @@ DESTDIR     =
 PREFIX      = /usr/local
 BINDIR      = $(DESTDIR)$(PREFIX)/bin
 
-SCRIPTS     = cov-analysis afl-stat.sh
+SCRIPTS     = cov-analysis
 
 all:
 	@echo "Run 'sudo make install' to install to $(BINDIR)"

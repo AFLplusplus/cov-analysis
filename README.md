@@ -221,14 +221,6 @@ Usage: cov-analysis diff [<OLD_JSON> <NEW_JSON>]
   Defaults to <report-dir>/coverage_old.json and <report-dir>/coverage.json.
 ```
 
-### afl-stat.sh
-
-Show statistics for a running or completed AFL campaign:
-
-```bash
-afl-stat.sh /path/to/afl-fuzz-output/
-```
-
 ## License
 
 `cov-analysis` is released under the **GNU Affero General Public License 3.0**.
