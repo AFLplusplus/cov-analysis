@@ -26,8 +26,8 @@ Version: 1.0.0
 `cov-analysis` generates **LLVM source-based code coverage** reports from a fuzzing corpus. It auto-detects the on-disk layout used by [AFL++](https://github.com/AFLplusplus/AFLplusplus) (queue/crashes/timeouts directories, single or parallel), libFuzzer (flat corpus dir plus `crash-*`/`leak-*`/`oom-*` artifacts), and honggfuzz (flat corpus plus `SIG*.fuzz` crash files). It replays each input through a coverage-instrumented binary, merges the raw profiles, and produces HTML, text, and JSON reports via `llvm-profdata` and `llvm-cov`.
 
 This is a rewrite of the original cov-analysis. Key changes in 1.0.0:
-- New key feature: generate a diff report on coverage to a previous run
-- New key feature: identify the lines in the code that are unstable (EXPLAIN HERE)
+- New: diff reports comparing coverage between two runs
+- New: stability analysis identifying source lines with non-deterministic hit counts
 - Replaced gcov/lcov/genhtml with LLVM source-based coverage (`-fprofile-instr-generate`, `llvm-profdata`, `llvm-cov`) - faster, more accurate under optimization
 - `cov-analysis build` sets compiler flags and builds the target; `cov-analysis driver` emits a ready-to-use `coverage_driver.c` for `LLVMFuzzerTestOneInput` harnesses
 - `cov-analysis diff` generates an HTML diff report comparing coverage between two JSON exports
@@ -90,7 +90,7 @@ The driver loops over all file arguments, calls `LLVMFuzzerTestOneInput` for eac
 
 ### Step 2: Generate Coverage Report
 
-This step will a `llvm-cov` coverage` report with regions and branches that looks like this:
+This step produces an `llvm-cov` coverage report with regions and branches:
 
 ![report overview](report-overview.png)
 ![report detail](report-detail.png)
@@ -156,7 +156,7 @@ Compare coverage between two `llvm-cov` JSON exports and generate an HTML diff r
 cov-analysis diff coverage_old.json coverage_new.json
 ```
 
-Note that if you specify the same output directory when generating a new report then the original `coverage_new.json` is renamed to `coverage_old.json` so this analysis can easily be performed.
+If you use the same output directory for a subsequent run, `cov-analysis` renames the existing `coverage.json` to `coverage_old.json` automatically, so `cov-analysis diff` works with no arguments.
 
 The report is written to `<report-dir>/coverage_diff.html` and shows:
 - Newly covered and no-longer-covered lines per file
@@ -165,7 +165,7 @@ The report is written to `<report-dir>/coverage_diff.html` and shows:
 
 If the JSON paths are omitted, `cov-analysis diff` defaults to `<report-dir>/coverage_old.json` and `<report-dir>/coverage.json`.
 
-This is how the HTML report looks like:
+The HTML diff report looks like this:
 
 ![diff overview](diff-overview.png)
 
@@ -173,8 +173,8 @@ This is how the HTML report looks like:
 
 ### Step 4: Identifying unstable code lines
 
-Ever wandered when AFL++'s afl-fuzz or libafl reported instability in a fuzz target what the offending lines in the code were?
-Fret no more! The `stability` command will find that out for you :-)
+Ever wondered which source lines cause AFL++ or libafl to report instability in a fuzz target?
+The `stability` command identifies them.
 
 ```bash
 cov-analysis stability -d ../afl/out -e "./cov @@"
