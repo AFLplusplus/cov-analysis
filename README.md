@@ -223,4 +223,4 @@ Usage: cov-analysis diff [<OLD_JSON> <NEW_JSON>]
 
 ## License
 
-`cov-analysis` is released under the **GNU Affero General Public License 3.0**.
+`cov-analysis` is released under the **GNU Affero General Public License 3**.

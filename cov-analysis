@@ -11,7 +11,7 @@
 #
 #  Copyright (c) 2026 by Marc "vanHauser" Heuse (vh@thc.org)
 #
-#  License: GNU Affero General Public License 3.0 or any later version)
+#  License: GNU Affero General Public License 3 or any later version)
 #
 
 set -euo pipefail
@@ -445,7 +445,7 @@ cmd_diff() {
 #
 # (c) 2026 Marc "vanHauser" Heuse
 #
-# License: GNU Affero General Public License 3.0
+# License: GNU Affero General Public License 3
 #
 
 import argparse
