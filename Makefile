@@ -13,4 +13,7 @@ install: $(SCRIPTS)
 uninstall:
 	cd $(BINDIR) && rm -f $(SCRIPTS)
 
-.PHONY: all install uninstall
+.PHONY: all install uninstall test
+
+test:
+	@bash tests/run.sh

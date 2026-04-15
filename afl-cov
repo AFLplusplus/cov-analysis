@@ -1052,23 +1052,26 @@ cmd_report() {
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
-test $# -eq 0 && { usage_main; exit 1; }
+# Only run main logic when executed directly (not when sourced from tests).
+if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
+  test $# -eq 0 && { usage_main; exit 1; }
 
-# Global flags before command detection
-case "$1" in
-  -V) echo "afl-cov-$VERSION"; exit 0 ;;
-  -h|--help) usage_main; exit 0 ;;
-esac
+  # Global flags before command detection
+  case "$1" in
+    -V) echo "afl-cov-$VERSION"; exit 0 ;;
+    -h|--help) usage_main; exit 0 ;;
+  esac
 
-# Detect optional command; default to "report"
-COMMAND="report"
-case "$1" in
-  build|report|diff|stability) COMMAND="$1"; shift ;;
-esac
+  # Detect optional command; default to "report"
+  COMMAND="report"
+  case "$1" in
+    build|report|diff|stability) COMMAND="$1"; shift ;;
+  esac
 
-case "$COMMAND" in
-  build)     cmd_build "$@" ;;
-  report)    cmd_report "$@" ;;
-  diff)      cmd_diff "$@" ;;
-  stability) cmd_stability "$@" ;;
-esac
+  case "$COMMAND" in
+    build)     cmd_build "$@" ;;
+    report)    cmd_report "$@" ;;
+    diff)      cmd_diff "$@" ;;
+    stability) cmd_stability "$@" ;;
+  esac
+fi
