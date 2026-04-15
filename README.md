@@ -93,6 +93,7 @@ The driver loops over all file arguments, calls `LLVMFuzzerTestOneInput` for eac
 This step produces an `llvm-cov` coverage report with regions and branches:
 
 <img align="left" src="https://raw.githubusercontent.com/AFLplusplus/cov-analysis/main/report-overview.png" alt="report overview">
+
 <img align="left" src="https://raw.githubusercontent.com/AFLplusplus/cov-analysis/main/report-detail.png" alt="report detail">
 
 ```bash
