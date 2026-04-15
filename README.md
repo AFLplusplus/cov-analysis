@@ -9,12 +9,14 @@ Version: 1.0.0
   - [Step 1: Build a Coverage Binary](#step-1-build-a-coverage-binary)
   - [Step 2: Generate Coverage Report](#step-2-generate-coverage-report)
   - [Step 3: Diff Two Coverage Reports](#step-3-diff-two-coverage-reports)
+  - [Step 4: Identifying unstable code lines](#step-4-identifying-unstable-code-lines)
   - [Parallelized AFL Execution](#parallelized-afl-execution)
 - [Usage Information](#usage-information)
   - [cov-analysis report (default)](#cov-analysis-report-default)
   - [cov-analysis build](#cov-analysis-build)
   - [cov-analysis driver](#cov-analysis-driver)
   - [cov-analysis diff](#cov-analysis-diff)
+  - [cov-analysis stability](#cov-analysis-stability)
 - [License](#license)
 
 ## Introduction
@@ -83,6 +85,11 @@ The driver loops over all file arguments, calls `LLVMFuzzerTestOneInput` for eac
 
 ### Step 2: Generate Coverage Report
 
+This step will a `llvm-cov` coverage` report with regions and branches that looks like this:
+
+![report overview](report-overview.png)
+![report detail](report-detail.png)
+
 ```bash
 cd /path/to/project-cov/
 cov-analysis -d /path/to/afl-fuzz-output/ -e "./cov @@"
@@ -144,12 +151,52 @@ Compare coverage between two `llvm-cov` JSON exports and generate an HTML diff r
 cov-analysis diff coverage_old.json coverage_new.json
 ```
 
+Note that if you specify the same output directory when generating a new report then the original `coverage_new.json` is renamed to `coverage_old.json` so this analysis can easily be performed.
+
 The report is written to `<report-dir>/coverage_diff.html` and shows:
 - Newly covered and no-longer-covered lines per file
 - Newly covered and lost functions
 - Source code snippets annotated with coverage change
 
 If the JSON paths are omitted, `cov-analysis diff` defaults to `<report-dir>/coverage_old.json` and `<report-dir>/coverage.json`.
+
+This is how the HTML report looks like:
+
+![diff overview](diff-overview.png)
+
+![diff detail](diff-detail.png)
+
+### Step 4: Identifying unstable code lines
+
+Ever wandered when AFL++'s afl-fuzz or libafl reported instability in a fuzz target what the offending lines in the code were?
+Fret no more! The `stability` command will find that out for you :-)
+
+```bash
+cov-analysis stability -d ../afl/out -e "./cov @@"
+```
+
+This will give you the exact lines that are problematic, e.g.:
+```
+Stability Report
+--------------------------------------------------------
+Corpus size : 2 inputs
+Runs        : 8
+Stability   : 74.0% (91/123 executed lines stable)
+
+~~ Variable-count lines (32 lines):
+   Lines with varying hit counts:
+
+  /prg/cov-analysis/tests/unstable.c:35-37
+  /prg/cov-analysis/tests/unstable.c:43
+  /prg/cov-analysis/tests/unstable.c:46-48
+  /prg/cov-analysis/tests/unstable.c:51-52
+  /prg/cov-analysis/tests/unstable.c:55-61
+  /prg/cov-analysis/tests/unstable.c:64-66
+  /prg/cov-analysis/tests/unstable.c:69-70
+  /prg/cov-analysis/tests/unstable.c:75-85
+
+[!] Unstable coverage detected.
+```
 
 ### Parallelized AFL Execution
 
@@ -219,6 +266,43 @@ Usage: cov-analysis diff [<OLD_JSON> <NEW_JSON>]
   lines and functions.
 
   Defaults to <report-dir>/coverage_old.json and <report-dir>/coverage.json.
+```
+
+### cov-analysis stability
+
+```
+Usage: cov-analysis stability [options]
+
+  Run each corpus input N times with LLVM coverage, collect per-line hit
+  counts, and flag lines where counts vary across runs as "unstable."
+  Reports a stability percentage. If instability is found with the default
+  4 runs, reruns for a total of 8 to confirm.
+
+Required:
+  -d <dir>    Fuzzing output directory (AFL++, libFuzzer, or honggfuzz)
+  -e <cmd>    Coverage command. Use @@ as input file placeholder.
+              Omit @@ to feed input via stdin instead.
+
+Optional:
+  -n <num>           Number of runs per corpus pass (default: 4)
+  -s <prefix>        Only consider source lines whose file path contains
+                     this prefix (e.g. -s src/)
+  -t <num>           Parallel replay workers (default: 1)
+  --layout <kind>    Force layout: 'afl' or 'flat' (default: auto-detect)
+  -v                 Verbose output
+  -q                 Quiet mode (suppress all [+] output)
+  -V                 Print version and exit
+  -h, --help         Print this help and exit
+```
+
+The command outputs a **Stability Report** showing corpus size, number of runs, and the stability percentage (stable executed lines / total executed lines). If unstable lines are found, they are listed with file paths and line number ranges.
+
+Examples:
+
+```bash
+cov-analysis stability -d out/ -e "./cov @@"
+cov-analysis stability -d out/ -e "./cov @@" -n 8 -s src/
+cov-analysis stability -d ./corpus -e "./cov @@" -t 4
 ```
 
 ## License
