@@ -1,9 +1,10 @@
-# afl-cov - AFL++ Fuzzing Code Coverage
+# afl-cov - Fuzzing Code Coverage for AFL++, libFuzzer, and honggfuzz
 
 Version: 1.0.0
 
 - [Introduction](#introduction)
 - [Prerequisites](#prerequisites)
+- [Supported Fuzzers](#supported-fuzzers)
 - [Workflow](#workflow)
   - [Step 1: Build a Coverage Binary](#step-1-build-a-coverage-binary)
   - [Step 2: Generate Coverage Report](#step-2-generate-coverage-report)
@@ -14,7 +15,7 @@ Version: 1.0.0
 
 ## Introduction
 
-`afl-cov` uses test case files produced by [AFL++](https://github.com/AFLplusplus/AFLplusplus) to generate **LLVM source-based code coverage** reports. It replays the entire corpus (queue, crashes, and timeouts) through a coverage-instrumented binary, merges the raw profiles, and produces HTML, text, and JSON reports via `llvm-profdata` and `llvm-cov`.
+`afl-cov` generates **LLVM source-based code coverage** reports from a fuzzing corpus. It auto-detects the on-disk layout used by [AFL++](https://github.com/AFLplusplus/AFLplusplus) (queue/crashes/timeouts directories, single or parallel), libFuzzer (flat corpus dir plus `crash-*`/`leak-*`/`oom-*` artifacts), and honggfuzz (flat corpus plus `SIG*.fuzz` crash files). It replays each input through a coverage-instrumented binary, merges the raw profiles, and produces HTML, text, and JSON reports via `llvm-profdata` and `llvm-cov`.
 
 This is a rewrite of the original afl-cov. Key changes in 1.0.0:
 - Replaced gcov/lcov/genhtml with LLVM source-based coverage (`-fprofile-instr-generate`, `llvm-profdata`, `llvm-cov`) - faster, more accurate under optimization
@@ -27,6 +28,18 @@ This is a rewrite of the original afl-cov. Key changes in 1.0.0:
 - `clang` (any version down to 11)
 - `llvm-profdata` and `llvm-cov` (matching the clang version; auto-detected)
 - AFL++ (`afl-fuzz`) - only needed to produce the corpus, not to run `afl-cov`
+
+## Supported Fuzzers
+
+| Fuzzer     | Detected by                                | Input files replayed                                                          |
+|------------|--------------------------------------------|-------------------------------------------------------------------------------|
+| AFL++      | `<dir>/queue/` or `<dir>/*/queue/` exists  | `queue/id:*`, `crashes/id:*`, `timeouts/id:*`                                 |
+| libFuzzer  | flat directory of files, no `queue/`       | all files except `crash-*`/`leak-*`/`oom-*`/`timeout-*`/`slow-unit-*`        |
+| honggfuzz  | flat directory of files, no `queue/`       | all files except `SIG*.fuzz` and `HONGGFUZZ.REPORT.TXT`                       |
+
+For libFuzzer and honggfuzz, crash-like files (above) are still replayed, but under the `-T` timeout so a hanging input can't stall the run.
+
+Override auto-detection with `--layout afl|flat`.
 
 ## Workflow
 
@@ -99,6 +112,22 @@ For stdin-based targets (binary reads from stdin, no file argument):
 afl-cov -d /path/to/afl-fuzz-output/ -e "./target"
 ```
 
+#### libFuzzer corpus
+
+```bash
+afl-cov -d /path/to/libfuzzer-corpus/ -e "./cov @@"
+```
+
+Corpus files are replayed in batch mode. If your libFuzzer run used `-artifact_prefix=./crashes/`, point a second run at that directory to cover crash inputs too — or move artifacts into the corpus dir beforehand.
+
+#### honggfuzz workspace
+
+```bash
+afl-cov -d /path/to/hfuzz-workdir/ -e "./cov @@"
+```
+
+`SIG*.fuzz` crash files are replayed under the `-T` timeout. The `HONGGFUZZ.REPORT.TXT` metadata file is ignored automatically.
+
 ### Step 3: Diff Two Coverage Reports
 
 Compare coverage between two `llvm-cov` JSON exports and generate an HTML diff report:
@@ -130,7 +159,7 @@ afl-cov -d /path/to/sync_dir/ -e "./cov @@"
 Usage: afl-cov [report] [options]
 
 Required:
-  -d <dir>    AFL++ fuzzing output directory
+  -d <dir>    Fuzzing output directory (AFL++, libFuzzer, or honggfuzz)
   -e <cmd>    Coverage command. Use @@ as input file placeholder.
               Omit @@ to feed input via stdin instead.
 
@@ -138,6 +167,7 @@ Optional:
   -o <dir>           Report output directory (default: <afl-dir>/cov)
   -t <num>           Parallel replay workers/forks (default: 1)
   -T <secs>          Timeout for crash/timeout replay (default: 5)
+  --layout <kind>    Force layout: 'afl' or 'flat' (default: auto-detect)
   --ignore-regex <r> Filename regex to exclude from llvm-cov reports
                      (default: /usr/include/)
   -v                 Verbose output
