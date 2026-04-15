@@ -7,6 +7,7 @@ Version: 1.0.0
 - [Workflow](#workflow)
   - [Step 1: Build a Coverage Binary](#step-1-build-a-coverage-binary)
   - [Step 2: Generate Coverage Report](#step-2-generate-coverage-report)
+  - [Step 3: Diff Two Coverage Reports](#step-3-diff-two-coverage-reports)
   - [Parallelized AFL Execution](#parallelized-afl-execution)
 - [Usage Information](#usage-information)
 - [License](#license)
@@ -18,7 +19,8 @@ Version: 1.0.0
 This is a rewrite of the original afl-cov. Key changes in 1.0.0:
 - Replaced gcov/lcov/genhtml with LLVM source-based coverage (`-fprofile-instr-generate`, `llvm-profdata`, `llvm-cov`) - faster, more accurate under optimization
 - Rewritten in bash (was Python)
-- `afl-cov-build.sh` now emits a ready-to-use `coverage_driver.c` for `LLVMFuzzerTestOneInput` harnesses
+- `afl-cov build` sets compiler flags and builds the target; `afl-cov build --driver` emits a ready-to-use `coverage_driver.c` for `LLVMFuzzerTestOneInput` harnesses
+- `afl-cov diff` generates an HTML diff report comparing coverage between two JSON exports
 
 ## Prerequisites
 
@@ -30,16 +32,16 @@ This is a rewrite of the original afl-cov. Key changes in 1.0.0:
 
 ### Step 1: Build a Coverage Binary
 
-Use `afl-cov-build.sh` to set the correct compiler flags and build your target:
+Use `afl-cov build` to set the correct compiler flags and build your target:
 
 ```bash
 # Set up a coverage build (run once per build step)
 cd /path/to/project-cov/
-afl-cov-build.sh ./configure --disable-shared
-afl-cov-build.sh make -j$(nproc)
+afl-cov build ./configure --disable-shared
+afl-cov build make -j$(nproc)
 ```
 
-`afl-cov-build.sh` sets:
+`afl-cov build` sets:
 ```
 CC=clang  CXX=clang++
 CFLAGS="-fprofile-instr-generate -fcoverage-mapping -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION=1"
@@ -53,7 +55,7 @@ LDFLAGS="-fprofile-instr-generate"
 Generate a replay driver and link it against your coverage-instrumented library:
 
 ```bash
-afl-cov-build.sh --driver -o coverage_driver.c
+afl-cov build --driver -o coverage_driver.c
 clang -fprofile-instr-generate -fcoverage-mapping \
   -c coverage_driver.c -o coverage_driver.o
 clang -fprofile-instr-generate \
@@ -97,6 +99,21 @@ For stdin-based targets (binary reads from stdin, no file argument):
 afl-cov -d /path/to/afl-fuzz-output/ -e "./target"
 ```
 
+### Step 3: Diff Two Coverage Reports
+
+Compare coverage between two `llvm-cov` JSON exports and generate an HTML diff report:
+
+```bash
+afl-cov diff coverage_old.json coverage_new.json
+```
+
+The report is written to `<report-dir>/coverage_diff.html` and shows:
+- Newly covered and no-longer-covered lines per file
+- Newly covered and lost functions
+- Source code snippets annotated with coverage change
+
+If the JSON paths are omitted, `afl-cov diff` defaults to `<report-dir>/coverage_old.json` and `<report-dir>/coverage.json`.
+
 ### Parallelized AFL Execution
 
 For parallel AFL runs (`afl-fuzz -o sync_dir`), point `-d` at the top-level sync directory. `afl-cov` automatically discovers all fuzzer instance subdirectories:
@@ -107,8 +124,10 @@ afl-cov -d /path/to/sync_dir/ -e "./cov @@"
 
 ## Usage Information
 
+### afl-cov report (default)
+
 ```
-Usage: afl-cov [options]
+Usage: afl-cov [report] [options]
 
 Required:
   -d <dir>    AFL++ fuzzing output directory
@@ -127,11 +146,31 @@ Optional:
   -h, --help         Print this help and exit
 ```
 
-### afl-cov-build.sh
+### afl-cov build
 
 ```
-afl-cov-build.sh <build-command> [args...]   # build mode
-afl-cov-build.sh --driver [-o output.c]      # emit coverage_driver.c
+Usage: afl-cov build <build-command> [args...]
+       afl-cov build --driver [-o output.c]
+
+Build mode:
+  Sets CC/CXX/CFLAGS/CXXFLAGS/LDFLAGS for LLVM source-based coverage and
+  runs the given build command.
+
+Driver mode (--driver):
+  Emits coverage_driver.c source to stdout (or to -o FILE).
+  Use this for LLVMFuzzerTestOneInput harnesses to replay corpus files.
+```
+
+### afl-cov diff
+
+```
+Usage: afl-cov diff [<OLD_JSON> <NEW_JSON>]
+
+  Compare coverage between two llvm-cov JSON exports and generate an
+  HTML diff report showing newly covered, lost, and still-uncovered
+  lines and functions.
+
+  Defaults to <report-dir>/coverage_old.json and <report-dir>/coverage.json.
 ```
 
 ### afl-stat.sh

@@ -18,63 +18,14 @@ set -euo pipefail
 
 VERSION="1.0.0"
 
-# ── defaults ──────────────────────────────────────────────────────────────────
-
-AFL_DIR=""
-COVERAGE_CMD=""
-REPORT_DIR=""
-TIMEOUT=5
-FORKS=1
-VERBOSE=0
-QUIET=0
-IGNORE_REGEX='/usr/include/'
-PROFRAW_DIR=""
-LLVM_PROFDATA=""
-LLVM_COV=""
-
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+QUIET=0
+VERBOSE=0
 
 log()  { test "$QUIET" -eq 0 && echo "[+] $*" || true; }
 logv() { test "$VERBOSE" -eq 1 && echo "[*] $*" || true; }
 err()  { echo "[-] $*" >&2; }
-
-usage() {
-  cat << 'EOF'
-Usage: afl-cov [options]
-
-Required:
-  -d <dir>    AFL++ fuzzing output directory
-  -e <cmd>    Coverage command. Use @@ as input file placeholder.
-              Omit @@ to feed input via stdin instead.
-
-Optional:
-  -o <dir>           Report output directory (default: <afl-dir>/cov)
-  -t <num>           Parallel replay workers/forks (default: 1)
-  -T <secs>          Timeout in seconds for crash/timeout replay (default: 5)
-  --ignore-regex <r> Filename regex to exclude from llvm-cov reports
-                     (default: /usr/include/)
-  -v                 Verbose output
-  -q                 Quiet mode (suppress all [+] output)
-  -V                 Print version and exit
-  -h, --help         Print this help and exit
-
-Examples:
-  # Standard replay with file-based input
-  afl-cov -d out -e "./cov @@"
-
-  # With env vars, custom report dir, 10s timeout
-  afl-cov -d out -e "LD_LIBRARY_PATH=./lib ./cov @@" -o coverage -T 10
-
-  # Replay coverage with 8 parallel workers
-  afl-cov -d out -e "./cov @@" -t 8
-
-  # stdin input (binary reads from stdin)
-  afl-cov -d out -e "./cov"
-
-  # Exclude test files and system headers from report
-  afl-cov -d out -e "./cov @@" --ignore-regex '(/usr/include/|/test/)'
-EOF
-}
 
 # Find an LLVM tool by bare name, then versioned (20 down to 11)
 find_tool() {
@@ -124,226 +75,1000 @@ count_files() {
   "$@" | tr -cd '\0' | wc -c
 }
 
-# ── argument parsing ──────────────────────────────────────────────────────────
+# Emit the coverage replay driver C source
+emit_driver() {
+  cat << 'DRIVER_EOF'
+/* coverage_driver.c - Replay driver for LLVMFuzzerTestOneInput harnesses.
+ * Reads files from command-line arguments and calls LLVMFuzzerTestOneInput.
+ * Crash handler flushes coverage data on signals so crashing inputs still
+ * contribute to the report.
+ *
+ * Compile and link example:
+ *   clang -fprofile-instr-generate -fcoverage-mapping \
+ *     -c coverage_driver.c -o coverage_driver.o
+ *   clang -fprofile-instr-generate \
+ *     coverage_driver.o -L./build -ltarget -o cov
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
 
-test $# -eq 0 && { usage; exit 1; }
+int LLVMFuzzerInitialize(int *argc, char ***argv) __attribute__((weak));
+int LLVMFuzzerTestOneInput(const unsigned char*, size_t);
 
-while [ $# -gt 0 ]; do
+extern int __llvm_profile_write_file(void);
+
+static void crash_handler(int sig) {
+    __llvm_profile_write_file();
+    fprintf(stderr, "ERROR: Coverage gathering aborted due signal!\n");
+    raise(sig);
+}
+
+__attribute__((constructor))
+static void install_crash_handlers(void) {
+    const int sigs[] = { SIGABRT, SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTERM };
+    struct sigaction sa = {
+        .sa_handler = crash_handler,
+        .sa_flags   = SA_RESETHAND,
+    };
+    sigemptyset(&sa.sa_mask);
+    for (int i = 0; i < (int)(sizeof(sigs) / sizeof(sigs[0])); i++)
+        sigaction(sigs[i], &sa, NULL);
+}
+
+int main(int argc, char **argv) {
+    // needed for auto-detection in compiled binaries:
+    if (argc == 2 && strcmp(argv[1], "--printsignature") == 0) {
+        printf("###SIGNATURE_LLVMFUZZERTESTONEINPUT_COVERAGE###\n");
+    }
+
+    if (LLVMFuzzerInitialize) {
+        fprintf(stderr, "Running LLVMFuzzerInitialize ...\n");
+        LLVMFuzzerInitialize(&argc, &argv);
+    }
+
+    for (int i = 1; i < argc; i++) {
+        FILE *f = fopen(argv[i], "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long len = ftell(f);
+            if (len > 0) {
+                fseek(f, 0, SEEK_SET);
+                unsigned char *buf = (unsigned char *)malloc((size_t)len);
+                if (buf) {
+                    size_t n_read = fread(buf, 1, (size_t)len, f);
+                    if (n_read > 0) {
+                        fprintf(stderr, "Running: %s (%d/%d) %zu bytes\n",
+                                argv[i], i, argc - 1, n_read);
+                        LLVMFuzzerTestOneInput((const unsigned char*)buf, n_read);
+                    } else {
+                        fprintf(stderr, "Error: Read failed for %s\n", argv[i]);
+                    }
+                    free(buf);
+                }
+            }
+            fclose(f);
+        }
+    }
+
+    fprintf(stderr, "Done.\n");
+    return 0;
+}
+DRIVER_EOF
+}
+
+# ── usage ─────────────────────────────────────────────────────────────────────
+
+usage_main() {
+  cat << 'EOF'
+Usage: afl-cov [command] [options]
+
+Commands:
+  report      Generate coverage report from AFL++ corpus (DEFAULT)
+  build       Build target with LLVM coverage instrumentation
+  diff        Compare coverage between two llvm-cov JSON exports
+  stability   Analyze corpus stability and deduplication (not yet implemented)
+
+Run 'afl-cov <command> --help' for command-specific options.
+
+Global options:
+  -V          Print version and exit
+  -h, --help  Print this help and exit
+EOF
+
+  echo ""
+  echo "Help for default command \"report\" (does not need to be specified):"
+  echo ""
+  usage_report
+}
+
+usage_report() {
+  cat << 'EOF'
+Usage: afl-cov [report] [options]
+
+Required:
+  -d <dir>    AFL++ fuzzing output directory
+  -e <cmd>    Coverage command. Use @@ as input file placeholder.
+              Omit @@ to feed input via stdin instead.
+
+Optional:
+  -o <dir>           Report output directory (default: <afl-dir>/cov)
+  -t <num>           Parallel replay workers/forks (default: 1)
+  -T <secs>          Timeout in seconds for crash/timeout replay (default: 5)
+  --ignore-regex <r> Filename regex to exclude from llvm-cov reports
+                     (default: /usr/include/)
+  -v                 Verbose output
+  -q                 Quiet mode (suppress all [+] output)
+  -V                 Print version and exit
+  -h, --help         Print this help and exit
+
+Examples:
+  # Standard replay with file-based input
+  afl-cov -d out -e "./cov @@"
+
+  # With env vars, custom report dir, 1s timeout
+  afl-cov -d out -e "LD_LIBRARY_PATH=./lib ./cov @@" -o coverage -T 1
+
+  # Replay coverage with 8 parallel workers
+  afl-cov -d out -e "./cov @@" -t 8
+
+  # stdin input (binary reads from stdin)
+  afl-cov -d out -e "./cov"
+
+  # Exclude test files and system headers from report
+  afl-cov -d out -e "./cov @@" --ignore-regex '(/usr/include/|/test/)'
+EOF
+}
+
+usage_build() {
+  cat << 'EOF'
+Usage: afl-cov build <build-command> [args...]
+       afl-cov build --driver [-o output.c]
+
+Build mode:
+  Sets CC/CXX/CFLAGS/CXXFLAGS/LDFLAGS for LLVM source-based coverage and
+  runs the given build command. Must be run once per build step, e.g.:
+    afl-cov build ./configure --disable-shared
+    afl-cov build make -j$(nproc)
+
+  Set CC/CXX environment variables to override the auto-detected clang.
+
+Driver mode (--driver):
+  Emits coverage_driver.c source to stdout (or to -o FILE).
+  Use this for LLVMFuzzerTestOneInput harnesses to replay corpus files.
+  Example:
+    afl-cov build --driver -o coverage_driver.c
+    clang -fprofile-instr-generate -fcoverage-mapping \
+      coverage_driver.c -L./build -ltarget -o cov
+
+Options:
+  -h, --help    Show this help
+  -V            Print version and exit
+EOF
+}
+
+usage_diff() {
+  cat << 'EOF'
+Usage: afl-cov diff [<OLD_JSON> <NEW_JSON>]
+
+  Compare coverage between two llvm-cov JSON exports and generate an
+  HTML diff report showing newly covered, lost, and still-uncovered
+  lines and functions.
+
+  Arguments:
+    OLD_JSON  Path to the baseline coverage JSON
+              (default: <report-dir>/coverage_old.json)
+    NEW_JSON  Path to the updated coverage JSON
+              (default: <report-dir>/coverage.json)
+
+Options:
+  -h, --help  Print this help and exit
+EOF
+}
+
+usage_stability() {
+  cat << 'EOF'
+Usage: afl-cov stability [options]
+
+  NOT YET IMPLEMENTED
+
+  Will analyze corpus stability, identify duplicate inputs, and report
+  on coverage contribution per corpus entry.
+
+Options:
+  -h, --help  Print this help and exit
+EOF
+}
+
+# ── command: build ────────────────────────────────────────────────────────────
+
+cmd_build() {
+  if test $# -eq 0; then usage_build; exit 1; fi
   case "$1" in
-    -d)            AFL_DIR="$2";       shift 2 ;;
-    -e)            COVERAGE_CMD="$2";  shift 2 ;;
-    -o)            REPORT_DIR="$2";    shift 2 ;;
-    -t)            FORKS="$2";         shift 2 ;;
-    -T)            TIMEOUT="$2";       shift 2 ;;
-    -v)            VERBOSE=1;          shift   ;;
-    -q)            QUIET=1;            shift   ;;
-    -V)            echo "afl-cov-$VERSION"; exit 0 ;;
-    -h|--help)     usage; exit 0 ;;
-    --ignore-regex) IGNORE_REGEX="$2"; shift 2 ;;
-    *) err "Unknown option: $1"; echo "" >&2; usage >&2; exit 1 ;;
+    -h|--help) usage_build; exit 0 ;;
+    -V)        echo "afl-cov-$VERSION"; exit 0 ;;
   esac
-done
 
-# ── validate inputs ───────────────────────────────────────────────────────────
+  if test "$1" = "--driver"; then
+    shift
+    if test "${1-}" = "-o"; then
+      test -z "${2-}" && { echo "[-] -o requires a filename" >&2; exit 1; }
+      emit_driver > "$2"
+      echo "[+] coverage_driver.c written to: $2" >&2
+    else
+      emit_driver
+    fi
+    exit 0
+  fi
 
-if test -z "$AFL_DIR"; then
-  err "Must specify AFL fuzzing dir with -d"
-  exit 1
-fi
-if test -z "$COVERAGE_CMD"; then
-  err "Must specify coverage command with -e"
-  exit 1
-fi
-if ! test -d "$AFL_DIR"; then
-  err "AFL directory does not exist: $AFL_DIR"
-  exit 1
-fi
-case "$FORKS" in
-  ''|*[!0-9]*|0)
-    err "Replay worker count must be a positive integer: $FORKS"
+  # Build mode: refuse if an AFL++ compiler is already set
+  echo " ${CC-} ${CXX-}" | grep -q afl && {
+    err "AFL++ compiler is set in CC/CXX — unset it before building a coverage binary."
     exit 1
-    ;;
-esac
+  }
 
-COV_BINARY="$(extract_binary "$COVERAGE_CMD")"
-if test -z "$COV_BINARY"; then
-  err "Could not extract binary path from coverage command: $COVERAGE_CMD"
-  exit 1
-fi
-if ! test -x "$COV_BINARY"; then
-  err "Coverage binary not found or not executable: $COV_BINARY"
-  exit 1
-fi
-logv "Coverage binary: $COV_BINARY"
-logv "Coverage command: $COVERAGE_CMD"
+  # Auto-detect clang if CC/CXX not set
+  if test -z "${CC-}"; then
+    if command -v clang >/dev/null 2>&1; then
+      export CC=clang
+      export CXX=clang++
+    else
+      for ver in 20 19 18 17 16 15 14 13 12 11; do
+        if command -v "clang-$ver" >/dev/null 2>&1; then
+          export CC="clang-$ver"
+          export CXX="clang++-$ver"
+          break
+        fi
+      done
+    fi
+  fi
 
-test -z "$REPORT_DIR" && REPORT_DIR="$AFL_DIR/cov"
+  test -z "${CC-}" && {
+    err "clang not found. Install clang or set CC/CXX."
+    exit 1
+  }
+  echo "[+] Using compiler: $CC / $CXX" >&2
 
-# ── detect LLVM tools ─────────────────────────────────────────────────────────
+  export CFLAGS="-fprofile-instr-generate -fcoverage-mapping -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION=1"
+  export CXXFLAGS="$CFLAGS"
+  export CPPFLAGS="$CFLAGS"
+  export LDFLAGS="-fprofile-instr-generate"
 
-LLVM_PROFDATA="$(find_tool llvm-profdata)" || {
-  err "llvm-profdata not found. Install LLVM (apt install llvm / dnf install llvm)."
+  exec "$@"
+}
+
+# ── command: stability (placeholder) ─────────────────────────────────────────
+
+cmd_stability() {
+  case "${1-}" in
+    -h|--help) usage_diff; exit 0 ;;
+    -V)        echo "afl-cov-$VERSION"; exit 0 ;;
+  esac
+  err "The 'stability' command is not yet implemented."
   exit 1
 }
-LLVM_COV="$(find_tool llvm-cov)" || {
-  err "llvm-cov not found. Install LLVM (apt install llvm / dnf install llvm)."
-  exit 1
+
+# ── command: diff ────────────────────────────────────────────────────────────
+
+cmd_diff() {
+  case "${1-}" in
+    -h|--help) usage_diff; exit 0 ;;
+    -V)        echo "afl-cov-$VERSION"; exit 0 ;;
+  esac
+  OLD="$1"
+  NEW="$2"
+  test -z "$OLD" && OLD="$REPORT_DIR/coverage_old.json"
+  test -z "$NEW" && NEW="$REPORT_DIR/coverage.json"
+  test -s "$OLD" || { err "The old JSON report does not exist: $OLD"; exit 1; }
+  test -s "$NEW" || { err "The new JSON report does not exist: $NEW"; exit 1; }
+  python3 - -o "$REPORT_DIR/coverage_diff.html" --only-changed "$OLD" "$NEW" << 'PYEOF'
+#
+# (c) 2026 Marc "vanHauser" Heuse
+#
+# License: GNU Affero General Public License 3.0
+#
+
+import argparse
+import html
+import json
+import os
+from pathlib import Path
+from typing import Dict, List, Tuple, Set
+
+
+def load_json(path: str):
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def merge_line_state(current: int, new: int) -> int:
+    # 0 = unknown/non-executable, 1 = uncovered, 2 = covered
+    if current == 2 or new == 2:
+        return 2
+    if current == 1 or new == 1:
+        return 1
+    return 0
+
+
+def extract_file_entries(root) -> Dict[str, List[dict]]:
+    entries: Dict[str, List[dict]] = {}
+    for obj in root.get('data', []):
+        for f in obj.get('files', []):
+            name = f.get('filename')
+            if not name:
+                continue
+            entries.setdefault(name, []).append(f)
+    return entries
+
+
+def line_states_from_segments(file_entry: dict) -> Dict[int, int]:
+    # Approximate per-line executable/covered state from file segments.
+    # Segment format is documented by llvm-cov export JSON tests as a list of
+    # [line, col, count, hasCount, isRegionEntry]. Newer LLVM may append fields,
+    # so we only use the first five when present.
+    segments = file_entry.get('segments', []) or []
+    states: Dict[int, int] = {}
+
+    for idx in range(len(segments) - 1):
+        cur = segments[idx]
+        nxt = segments[idx + 1]
+        if len(cur) < 4 or len(nxt) < 2:
+            continue
+
+        start_line = int(cur[0])
+        end_line = int(nxt[0])
+        count = int(cur[2])
+        has_count = bool(cur[3])
+
+        if not has_count:
+            continue
+
+        new_state = 2 if count > 0 else 1
+        for line in range(start_line, end_line + 1):
+            states[line] = merge_line_state(states.get(line, 0), new_state)
+
+    return states
+
+
+def merge_line_states(file_entries: List[dict]) -> Dict[int, int]:
+    merged: Dict[int, int] = {}
+    for entry in file_entries:
+        for line, state in line_states_from_segments(entry).items():
+            merged[line] = merge_line_state(merged.get(line, 0), state)
+    return merged
+
+
+def extract_functions(root) -> Dict[str, Dict[str, bool]]:
+    # filename -> function name -> covered?
+    out: Dict[str, Dict[str, bool]] = {}
+    for obj in root.get('data', []):
+        for fn in obj.get('functions', []) or []:
+            name = fn.get('name', '<unknown>')
+            covered = int(fn.get('count', 0) or 0) > 0
+            filenames = fn.get('filenames', []) or []
+            if not filenames:
+                continue
+            for filename in filenames:
+                file_map = out.setdefault(filename, {})
+                file_map[name] = file_map.get(name, False) or covered
+    return out
+
+
+def read_source_lines(filename: str) -> List[str]:
+    try:
+        with open(filename, 'r', encoding='utf-8', errors='replace') as f:
+            return f.read().splitlines()
+    except OSError:
+        return []
+
+
+def fmt_pct(numer: int, denom: int) -> str:
+    if denom <= 0:
+        return 'n/a'
+    return f'{(100.0 * numer / denom):.1f}%'
+
+
+def compute_file_diff(filename: str, base_lines: Dict[int, int], upd_lines: Dict[int, int],
+                      base_funcs: Dict[str, bool], upd_funcs: Dict[str, bool]) -> dict:
+    all_lines = sorted(set(base_lines) | set(upd_lines))
+    newly_covered = [ln for ln in all_lines if base_lines.get(ln, 0) != 2 and upd_lines.get(ln, 0) == 2]
+    no_longer_covered = [ln for ln in all_lines if base_lines.get(ln, 0) == 2 and upd_lines.get(ln, 0) != 2]
+    still_uncovered = [ln for ln in all_lines if base_lines.get(ln, 0) == 1 and upd_lines.get(ln, 0) == 1]
+    executable_now = [ln for ln in all_lines if upd_lines.get(ln, 0) in (1, 2)]
+    covered_now = [ln for ln in all_lines if upd_lines.get(ln, 0) == 2]
+    executable_before = [ln for ln in all_lines if base_lines.get(ln, 0) in (1, 2)]
+    covered_before = [ln for ln in all_lines if base_lines.get(ln, 0) == 2]
+
+    all_fn_names = sorted(set(base_funcs) | set(upd_funcs))
+    newly_covered_fns = [n for n in all_fn_names if not base_funcs.get(n, False) and upd_funcs.get(n, False)]
+    lost_fns = [n for n in all_fn_names if base_funcs.get(n, False) and not upd_funcs.get(n, False)]
+    still_uncovered_fns = [n for n in all_fn_names if not base_funcs.get(n, False) and not upd_funcs.get(n, False)]
+    covered_fns_before = sum(1 for n in all_fn_names if base_funcs.get(n, False))
+    covered_fns_now = sum(1 for n in all_fn_names if upd_funcs.get(n, False))
+
+    return {
+        'filename': filename,
+        'base_executable': len(executable_before),
+        'base_covered': len(covered_before),
+        'upd_executable': len(executable_now),
+        'upd_covered': len(covered_now),
+        'newly_covered': newly_covered,
+        'no_longer_covered': no_longer_covered,
+        'still_uncovered': still_uncovered,
+        'all_lines': all_lines,
+        'newly_covered_fns': newly_covered_fns,
+        'lost_fns': lost_fns,
+        'still_uncovered_fns': still_uncovered_fns,
+        'fn_total': len(all_fn_names),
+        'fn_covered_before': covered_fns_before,
+        'fn_covered_now': covered_fns_now,
+    }
+
+
+def make_snippet_ranges(lines_of_interest: List[int], max_context: int = 2) -> List[Tuple[int, int]]:
+    if not lines_of_interest:
+        return []
+    ranges: List[Tuple[int, int]] = []
+    for line in sorted(set(lines_of_interest)):
+        start = max(1, line - max_context)
+        end = line + max_context
+        if not ranges or start > ranges[-1][1] + 1:
+            ranges.append((start, end))
+        else:
+            ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
+    return ranges
+
+
+def render_code_snippets(filename: str, diff: dict, source_lines: List[str]) -> str:
+    interesting = diff['newly_covered'] + diff['no_longer_covered'] + diff['still_uncovered']
+    ranges = make_snippet_ranges(interesting)
+    if not source_lines:
+        if not interesting:
+            return '<p class="muted">No line-level changes.</p>'
+        lis = ''.join(f'<li>{ln}</li>' for ln in interesting)
+        return f'<p class="muted">Source file not readable on disk. Interesting lines:</p><ul>{lis}</ul>'
+    if not ranges:
+        return '<p class="muted">No line-level changes.</p>'
+
+    parts = []
+    for start, end in ranges:
+        parts.append('<div class="snippet">')
+        parts.append(f'<div class="snippet-header">{html.escape(filename)}:{start}-{min(end, len(source_lines))}</div>')
+        parts.append('<table class="code">')
+        for ln in range(start, min(end, len(source_lines)) + 1):
+            src = html.escape(source_lines[ln - 1])
+            cls = []
+            label = ''
+            if ln in diff['newly_covered']:
+                cls.append('new-covered')
+                label = 'new'
+            elif ln in diff['no_longer_covered']:
+                cls.append('lost-covered')
+                label = 'lost'
+            elif ln in diff['still_uncovered']:
+                cls.append('still-uncovered')
+                label = 'still uncovered'
+            state = ' '.join(cls)
+            parts.append(
+                f'<tr class="{state}"><td class="ln">{ln}</td><td class="tag">{label}</td>'
+                f'<td class="src"><pre>{src}</pre></td></tr>'
+            )
+        parts.append('</table></div>')
+    return ''.join(parts)
+
+
+def render_html(diffs: List[dict], baseline_name: str, updated_name: str, output_path: str):
+    total_new = sum(len(d['newly_covered']) for d in diffs)
+    total_lost = sum(len(d['no_longer_covered']) for d in diffs)
+    total_still = sum(len(d['still_uncovered']) for d in diffs)
+    total_new_fns = sum(len(d['newly_covered_fns']) for d in diffs)
+    total_lost_fns = sum(len(d['lost_fns']) for d in diffs)
+
+    changed_files = [d for d in diffs if d['newly_covered'] or d['no_longer_covered'] or d['newly_covered_fns'] or d['lost_fns']]
+    changed_files_count = len(changed_files)
+
+    rows = []
+    for d in diffs:
+        row_class = 'regressed' if d['no_longer_covered'] or d['lost_fns'] else ('improved' if d['newly_covered'] or d['newly_covered_fns'] else '')
+        rows.append(
+            '<tr class="%s">'
+            '<td><a href="#file-%s">%s</a></td>'
+            '<td>%s</td>'
+            '<td>%s</td>'
+            '<td>%d</td>'
+            '<td>%d</td>'
+            '<td>%d</td>'
+            '<td>%d</td>'
+            '<td>%d</td>'
+            '</tr>' % (
+                row_class,
+                html.escape(d['filename'], quote=True).replace('/', '_').replace(' ', '_'),
+                html.escape(d['filename']),
+                fmt_pct(d['base_covered'], d['base_executable']),
+                fmt_pct(d['upd_covered'], d['upd_executable']),
+                len(d['newly_covered']),
+                len(d['no_longer_covered']),
+                len(d['still_uncovered']),
+                len(d['newly_covered_fns']),
+                len(d['lost_fns']),
+            )
+        )
+
+    file_sections = []
+    for d in diffs:
+        file_id = html.escape(d['filename'], quote=True).replace('/', '_').replace(' ', '_')
+        src_lines = read_source_lines(d['filename'])
+        code = render_code_snippets(d['filename'], d, src_lines)
+
+        def render_fn_list(title: str, items: List[str], cls: str) -> str:
+            if not items:
+                return ''
+            chips = ''.join(f'<span class="chip {cls}">{html.escape(x)}</span>' for x in items[:200])
+            return f'<div class="fn-group"><div class="fn-title">{html.escape(title)}</div><div class="chips">{chips}</div></div>'
+
+        file_sections.append(f'''
+<section id="file-{file_id}" class="file-card">
+  <div class="file-head">
+    <div>
+      <h2>{html.escape(d['filename'])}</h2>
+      <div class="muted">
+        lines: {fmt_pct(d['base_covered'], d['base_executable'])} → {fmt_pct(d['upd_covered'], d['upd_executable'])}
+        &nbsp;&nbsp; functions: {fmt_pct(d['fn_covered_before'], d['fn_total'])} → {fmt_pct(d['fn_covered_now'], d['fn_total'])}
+      </div>
+    </div>
+    <div class="pill-row">
+      <span class="pill green">+{len(d['newly_covered'])} new lines</span>
+      <span class="pill red">-{len(d['no_longer_covered'])} lost lines</span>
+      <span class="pill amber">{len(d['still_uncovered'])} still uncovered</span>
+    </div>
+  </div>
+  {render_fn_list('Newly covered functions', d['newly_covered_fns'], 'chip-green')}
+  {render_fn_list('No longer covered functions', d['lost_fns'], 'chip-red')}
+  {render_fn_list('Still uncovered functions', d['still_uncovered_fns'], 'chip-amber')}
+  {code}
+</section>
+''')
+
+    html_doc = f'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLVM coverage diff</title>
+<style>
+:root {{
+  --bg: #0b1020;
+  --panel: #121933;
+  --panel-2: #0f1530;
+  --text: #e8ecf8;
+  --muted: #9ea8c7;
+  --border: #27304f;
+  --green: #163a26;
+  --green-2: #1e7a45;
+  --red: #3d1720;
+  --red-2: #b0465d;
+  --amber: #413315;
+  --amber-2: #ba8f2a;
+  --blue: #4d8cff;
+}}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: linear-gradient(180deg, #0b1020, #09101b 30%, #081018); color: var(--text); }}
+.container {{ max-width: 1400px; margin: 0 auto; padding: 28px; }}
+header {{ display: flex; justify-content: space-between; gap: 16px; align-items: end; margin-bottom: 22px; }}
+h1 {{ margin: 0; font-size: 32px; }}
+.sub {{ color: var(--muted); margin-top: 8px; }}
+.cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin: 20px 0 26px; }}
+.card {{ background: rgba(18, 25, 51, 0.88); border: 1px solid var(--border); border-radius: 18px; padding: 18px; box-shadow: 0 10px 30px rgba(0,0,0,.25); }}
+.card .k {{ color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: .08em; }}
+.card .v {{ font-size: 28px; margin-top: 8px; font-weight: 700; }}
+.table-wrap, .file-card {{ background: rgba(18, 25, 51, 0.88); border: 1px solid var(--border); border-radius: 18px; box-shadow: 0 10px 30px rgba(0,0,0,.25); }}
+.table-wrap {{ overflow: hidden; margin-bottom: 26px; }}
+table.summary {{ width: 100%; border-collapse: collapse; }}
+table.summary th, table.summary td {{ padding: 12px 14px; border-bottom: 1px solid rgba(255,255,255,.06); text-align: left; font-variant-numeric: tabular-nums; }}
+table.summary th {{ color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; background: rgba(255,255,255,.02); }}
+table.summary tr:hover td {{ background: rgba(255,255,255,.025); }}
+table.summary tr.improved td:first-child {{ border-left: 4px solid var(--green-2); }}
+table.summary tr.regressed td:first-child {{ border-left: 4px solid var(--red-2); }}
+a {{ color: #a8c7ff; text-decoration: none; }}
+a:hover {{ text-decoration: underline; }}
+.file-card {{ padding: 18px; margin: 18px 0; }}
+.file-head {{ display: flex; justify-content: space-between; gap: 16px; align-items: start; margin-bottom: 16px; }}
+.file-head h2 {{ margin: 0 0 8px; font-size: 20px; word-break: break-all; }}
+.muted {{ color: var(--muted); }}
+.pill-row {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+.pill {{ padding: 6px 10px; border-radius: 999px; font-size: 12px; border: 1px solid transparent; }}
+.pill.green {{ background: rgba(30,122,69,.16); border-color: rgba(30,122,69,.45); }}
+.pill.red {{ background: rgba(176,70,93,.16); border-color: rgba(176,70,93,.45); }}
+.pill.amber {{ background: rgba(186,143,42,.16); border-color: rgba(186,143,42,.45); }}
+.fn-group {{ margin: 14px 0; }}
+.fn-title {{ color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 8px; }}
+.chips {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+.chip {{ padding: 6px 10px; border-radius: 999px; font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
+.chip-green {{ background: rgba(30,122,69,.18); border: 1px solid rgba(30,122,69,.45); }}
+.chip-red {{ background: rgba(176,70,93,.18); border: 1px solid rgba(176,70,93,.45); }}
+.chip-amber {{ background: rgba(186,143,42,.18); border: 1px solid rgba(186,143,42,.45); }}
+.snippet {{ margin-top: 16px; border: 1px solid rgba(255,255,255,.06); border-radius: 14px; overflow: hidden; }}
+.snippet-header {{ padding: 10px 12px; background: rgba(255,255,255,.03); color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }}
+table.code {{ width: 100%; border-collapse: collapse; }}
+table.code td {{ vertical-align: top; border-bottom: 1px solid rgba(255,255,255,.04); }}
+table.code .ln {{ width: 72px; color: var(--muted); text-align: right; padding: 0 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; user-select: none; }}
+table.code .tag {{ width: 120px; padding: 0 10px; color: var(--muted); text-transform: uppercase; font-size: 11px; letter-spacing: .08em; }}
+table.code .src {{ width: auto; }}
+table.code pre {{ margin: 0; padding: 0 12px 0 0; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.45; }}
+tr.new-covered td {{ background: linear-gradient(90deg, rgba(30,122,69,.36), rgba(30,122,69,.12)); }}
+tr.lost-covered td {{ background: linear-gradient(90deg, rgba(176,70,93,.34), rgba(176,70,93,.10)); }}
+tr.still-uncovered td {{ background: linear-gradient(90deg, rgba(186,143,42,.25), rgba(186,143,42,.08)); }}
+footer {{ color: var(--muted); margin-top: 24px; font-size: 12px; }}
+@media (max-width: 920px) {{
+  .file-head {{ flex-direction: column; }}
+  table.summary {{ display: block; overflow-x: auto; }}
+}}
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div>
+      <h1>LLVM coverage diff</h1>
+      <div class="sub">baseline: {html.escape(baseline_name)} &nbsp;→&nbsp; updated: {html.escape(updated_name)}</div>
+    </div>
+  </header>
+
+  <section class="cards">
+    <div class="card"><div class="k">Files with changes</div><div class="v">{changed_files_count}</div></div>
+    <div class="card"><div class="k">Newly covered lines</div><div class="v">{total_new}</div></div>
+    <div class="card"><div class="k">No longer covered lines</div><div class="v">{total_lost}</div></div>
+    <div class="card"><div class="k">Still uncovered lines</div><div class="v">{total_still}</div></div>
+    <div class="card"><div class="k">Newly covered functions</div><div class="v">{total_new_fns}</div></div>
+    <div class="card"><div class="k">No longer covered functions</div><div class="v">{total_lost_fns}</div></div>
+  </section>
+
+  <div class="table-wrap">
+    <table class="summary">
+      <thead>
+        <tr>
+          <th>file</th>
+          <th>baseline lines</th>
+          <th>updated lines</th>
+          <th>new</th>
+          <th>lost</th>
+          <th>still uncovered</th>
+          <th>new fns</th>
+          <th>lost fns</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(rows)}
+      </tbody>
+    </table>
+  </div>
+
+  {''.join(file_sections)}
+
+  <footer>
+    Generated from llvm-cov export JSON. Line-level status is reconstructed from file segment data and is intended for practical diffing.
+  </footer>
+</div>
+</body>
+</html>'''
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(html_doc)
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Generate an HTML diff report from two llvm-cov export JSON files.')
+    ap.add_argument('baseline_json')
+    ap.add_argument('updated_json')
+    ap.add_argument('-o', '--output', default='coverage-diff.html', help='HTML output filename, default is "coverage-diff.html".')
+    ap.add_argument('--only-changed', action='store_true', help='Only include files with line/function coverage changes in the report.')
+    args = ap.parse_args()
+
+    baseline = load_json(args.baseline_json)
+    updated = load_json(args.updated_json)
+
+    base_file_entries = extract_file_entries(baseline)
+    upd_file_entries = extract_file_entries(updated)
+    base_funcs = extract_functions(baseline)
+    upd_funcs = extract_functions(updated)
+
+    filenames = sorted(set(base_file_entries) | set(upd_file_entries) | set(base_funcs) | set(upd_funcs))
+
+    diffs: List[dict] = []
+    for filename in filenames:
+        diff = compute_file_diff(
+            filename,
+            merge_line_states(base_file_entries.get(filename, [])),
+            merge_line_states(upd_file_entries.get(filename, [])),
+            base_funcs.get(filename, {}),
+            upd_funcs.get(filename, {}),
+        )
+        if args.only_changed and not (
+            diff['newly_covered'] or diff['no_longer_covered'] or diff['newly_covered_fns'] or diff['lost_fns']
+        ):
+            continue
+        diffs.append(diff)
+
+    diffs.sort(key=lambda d: (
+        -(len(d['no_longer_covered']) + len(d['lost_fns']) > 0),
+        -(len(d['newly_covered']) + len(d['newly_covered_fns'])),
+        d['filename'],
+    ))
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    render_html(diffs, os.path.basename(args.baseline_json), os.path.basename(args.updated_json), str(out_path))
+
+
+if __name__ == '__main__':
+    main()
+PYEOF
+  log "Coverage difference report written to $REPORT_DIR/coverage_diff.html"
+  exit 0
 }
-log "LLVM tools: $LLVM_PROFDATA, $LLVM_COV"
 
-# ── prepare workspace ─────────────────────────────────────────────────────────
+# ── command: report ───────────────────────────────────────────────────────────
 
-PROFRAW_DIR="$(mktemp -d /tmp/afl-cov-profraw.XXXXXX)"
-trap 'rm -rf "$PROFRAW_DIR"' EXIT INT TERM
+cmd_report() {
+  # ── defaults ────────────────────────────────────────────────────────────────
+  local AFL_DIR=""
+  local COVERAGE_CMD=""
+  local REPORT_DIR=""
+  local TIMEOUT=5
+  local FORKS=1
+  local IGNORE_REGEX='/usr/include/'
+  local PROFRAW_DIR=""
+  local LLVM_PROFDATA=""
+  local LLVM_COV=""
 
-mkdir -p "$REPORT_DIR/html" "$REPORT_DIR/text"
-export LLVM_PROFILE_FILE="$PROFRAW_DIR/cov-%p.profraw"
+  # ── argument parsing ───────────────────────────────────────────────────────
+  if test $# -eq 0; then usage_report; exit 1; fi
 
-log "AFL directory  : $AFL_DIR"
-log "Report directory: $REPORT_DIR"
-log "Replay workers : $FORKS"
-logv "Profraw temp dir: $PROFRAW_DIR"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -d)            AFL_DIR="$2";       shift 2 ;;
+      -e)            COVERAGE_CMD="$2";  shift 2 ;;
+      -o)            REPORT_DIR="$2";    shift 2 ;;
+      -t)            FORKS="$2";         shift 2 ;;
+      -T)            TIMEOUT="$2";       shift 2 ;;
+      -v)            VERBOSE=1;          shift   ;;
+      -q)            QUIET=1;            shift   ;;
+      -V)            echo "afl-cov-$VERSION"; exit 0 ;;
+      -h|--help)     usage_report; exit 0 ;;
+      --ignore-regex) IGNORE_REGEX="$2"; shift 2 ;;
+      *) err "Unknown option: $1"; echo "" >&2; usage_report >&2; exit 1 ;;
+    esac
+  done
 
-# ── replay queue files ────────────────────────────────────────────────────────
+  # ── validate inputs ────────────────────────────────────────────────────────
+  if test -z "$AFL_DIR"; then
+    err "Must specify AFL fuzzing dir with -d"
+    exit 1
+  fi
+  if test -z "$COVERAGE_CMD"; then
+    err "Must specify coverage command with -e"
+    exit 1
+  fi
+  if ! test -d "$AFL_DIR"; then
+    err "AFL directory does not exist: $AFL_DIR"
+    exit 1
+  fi
+  case "$FORKS" in
+    ''|*[!0-9]*|0)
+      err "Replay worker count must be a positive integer: $FORKS"
+      exit 1
+      ;;
+  esac
 
-QUEUE_COUNT=$(count_files find_queue_files)
-log "Replaying $QUEUE_COUNT queue files..."
+  local COV_BINARY
+  COV_BINARY="$(extract_binary "$COVERAGE_CMD")"
+  if test -z "$COV_BINARY"; then
+    err "Could not extract binary path from coverage command: $COVERAGE_CMD"
+    exit 1
+  fi
+  if ! test -x "$COV_BINARY"; then
+    err "Coverage binary not found or not executable: $COV_BINARY"
+    exit 1
+  fi
+  logv "Coverage binary: $COV_BINARY"
+  logv "Coverage command: $COVERAGE_CMD"
 
-if echo "$COVERAGE_CMD" | grep -q '@@'; then
-  # Determine if @@ is the last token (enables fast batch mode)
-  LAST_TOKEN="${COVERAGE_CMD##* }"
-  if test "$LAST_TOKEN" = "@@"; then
-    # Fast batch: strip trailing @@ and let xargs append all files at once.
-    # sh -c handles env assignments (e.g. LD_LIBRARY_PATH=./lib ./cov) correctly.
-    CMD_NO_AT="${COVERAGE_CMD% @@}"
-    logv "Queue replay: batch (xargs, workers=$FORKS)"
-    # shellcheck disable=SC2016
-    find_queue_files | xargs -0 -r -n 128 -P "$FORKS" \
-      sh -c "${CMD_NO_AT}"' "$@"' -- >/dev/null 2>&1 || true
+  test -z "$REPORT_DIR" && REPORT_DIR="$AFL_DIR/cov"
+
+  # ── detect LLVM tools ──────────────────────────────────────────────────────
+  LLVM_PROFDATA="$(find_tool llvm-profdata)" || {
+    err "llvm-profdata not found. Install LLVM (apt install llvm / dnf install llvm)."
+    exit 1
+  }
+  LLVM_COV="$(find_tool llvm-cov)" || {
+    err "llvm-cov not found. Install LLVM (apt install llvm / dnf install llvm)."
+    exit 1
+  }
+  log "LLVM tools: $LLVM_PROFDATA, $LLVM_COV"
+
+  # ── prepare workspace ──────────────────────────────────────────────────────
+  PROFRAW_DIR="$(mktemp -d /tmp/afl-cov-profraw.XXXXXX)"
+  trap 'rm -rf "$PROFRAW_DIR"' EXIT INT TERM
+
+  rm -rf "$REPORT_DIR/html" "$REPORT_DIR/text"
+  mkdir -p "$REPORT_DIR/html" "$REPORT_DIR/text"
+  export LLVM_PROFILE_FILE="$PROFRAW_DIR/cov-%p.profraw"
+
+  log "AFL directory  : $AFL_DIR"
+  log "Report directory: $REPORT_DIR"
+  log "Replay workers : $FORKS"
+  logv "Profraw temp dir: $PROFRAW_DIR"
+
+  # ── replay queue files ─────────────────────────────────────────────────────
+  local QUEUE_COUNT
+  QUEUE_COUNT=$(count_files find_queue_files)
+  log "Replaying $QUEUE_COUNT queue files..."
+
+  if echo "$COVERAGE_CMD" | grep -q '@@'; then
+    # Determine if @@ is the last token (enables fast batch mode)
+    local LAST_TOKEN="${COVERAGE_CMD##* }"
+    if test "$LAST_TOKEN" = "@@"; then
+      if ! grep -qaF '###SIGNATURE_LLVMFUZZERTESTONEINPUT_COVERAGE###' "$COV_BINARY" 2>/dev/null; then
+        LAST_TOKEN="x"
+      fi
+    fi
+    if test "$LAST_TOKEN" = "@@"; then
+      # Fast batch: strip trailing @@ and let xargs append all files at once.
+      # sh -c handles env assignments (e.g. LD_LIBRARY_PATH=./lib ./cov) correctly.
+      local CMD_NO_AT="${COVERAGE_CMD% @@}"
+      logv "Queue replay: batch (xargs, workers=$FORKS)"
+      # shellcheck disable=SC2016
+      find_queue_files | xargs -0 -r -n 128 -P "$FORKS" \
+        sh -c "${CMD_NO_AT}"' "$@"' -- >/dev/null 2>&1 || true
+    else
+      # @@ is embedded mid-command (e.g. "./cov -f @@ -extra") — loop mode
+      logv "Queue replay: loop (mid-command @@, workers=$FORKS)"
+      find_queue_files | xargs -0 -r -n 1 -P "$FORKS" \
+        bash -c '
+          coverage_cmd="$1"
+          f="$2"
+          cmd="${coverage_cmd/@@/$f}"
+          sh -c "$cmd" >/dev/null 2>&1 || true
+        ' _ "$COVERAGE_CMD"
+    fi
   else
-    # @@ is embedded mid-command (e.g. "./cov -f @@ -extra") — loop mode
-    logv "Queue replay: loop (mid-command @@, workers=$FORKS)"
+    # No @@ — feed each file via stdin
+    logv "Queue replay: stdin loop (workers=$FORKS)"
     find_queue_files | xargs -0 -r -n 1 -P "$FORKS" \
       bash -c '
         coverage_cmd="$1"
         f="$2"
-        cmd="${coverage_cmd/@@/$f}"
-        sh -c "$cmd" >/dev/null 2>&1 || true
+        sh -c "$coverage_cmd" < "$f" >/dev/null 2>&1 || true
       ' _ "$COVERAGE_CMD"
   fi
-else
-  # No @@ — feed each file via stdin
-  logv "Queue replay: stdin loop (workers=$FORKS)"
-  find_queue_files | xargs -0 -r -n 1 -P "$FORKS" \
-    bash -c '
-      coverage_cmd="$1"
-      f="$2"
-      sh -c "$coverage_cmd" < "$f" >/dev/null 2>&1 || true
-    ' _ "$COVERAGE_CMD"
-fi
 
-# ── replay crashes and timeouts ───────────────────────────────────────────────
-
-CRASH_COUNT=$(count_files find_crash_timeout_files)
-if test "$CRASH_COUNT" -gt 0; then
-  log "Replaying $CRASH_COUNT crash/timeout files (timeout=${TIMEOUT}s each)..."
-  if echo "$COVERAGE_CMD" | grep -q '@@'; then
-    find_crash_timeout_files | xargs -0 -r -n 1 -P "$FORKS" \
-      bash -c '
-        coverage_cmd="$1"
-        timeout_secs="$2"
-        f="$3"
-        cmd="${coverage_cmd/@@/$f}"
-        timeout --signal=SIGTERM "${timeout_secs}s" sh -c "$cmd" >/dev/null 2>&1 || true
-      ' _ "$COVERAGE_CMD" "$TIMEOUT"
-  else
-    find_crash_timeout_files | xargs -0 -r -n 1 -P "$FORKS" \
-      bash -c '
-        coverage_cmd="$1"
-        timeout_secs="$2"
-        f="$3"
-        timeout --signal=SIGTERM "${timeout_secs}s" sh -c "$coverage_cmd" < "$f" >/dev/null 2>&1 || true
-      ' _ "$COVERAGE_CMD" "$TIMEOUT"
+  # ── replay crashes and timeouts ────────────────────────────────────────────
+  local CRASH_COUNT
+  CRASH_COUNT=$(count_files find_crash_timeout_files)
+  if test "$CRASH_COUNT" -gt 0; then
+    log "Replaying $CRASH_COUNT crash/timeout files (timeout=${TIMEOUT}s each)..."
+    if echo "$COVERAGE_CMD" | grep -q '@@'; then
+      find_crash_timeout_files | xargs -0 -r -n 1 -P "$FORKS" \
+        bash -c '
+          coverage_cmd="$1"
+          timeout_secs="$2"
+          f="$3"
+          cmd="${coverage_cmd/@@/$f}"
+          timeout --signal=SIGTERM "${timeout_secs}s" sh -c "$cmd" >/dev/null 2>&1 || true
+        ' _ "$COVERAGE_CMD" "$TIMEOUT"
+    else
+      find_crash_timeout_files | xargs -0 -r -n 1 -P "$FORKS" \
+        bash -c '
+          coverage_cmd="$1"
+          timeout_secs="$2"
+          f="$3"
+          timeout --signal=SIGTERM "${timeout_secs}s" sh -c "$coverage_cmd" < "$f" >/dev/null 2>&1 || true
+        ' _ "$COVERAGE_CMD" "$TIMEOUT"
+    fi
   fi
-fi
 
-# ── check profraw files were generated ───────────────────────────────────────
+  # ── check profraw files were generated ────────────────────────────────────
+  local PROFRAW_COUNT
+  PROFRAW_COUNT=$(find "$PROFRAW_DIR" -name '*.profraw' 2>/dev/null | wc -l)
+  if test "$PROFRAW_COUNT" -eq 0; then
+    err "No .profraw files generated."
+    err "Check that the binary is instrumented with -fprofile-instr-generate."
+    err "Use 'afl-cov build' to build the coverage binary."
+    exit 1
+  fi
+  logv "Generated $PROFRAW_COUNT .profraw file(s)"
 
-PROFRAW_COUNT=$(find "$PROFRAW_DIR" -name '*.profraw' 2>/dev/null | wc -l)
-if test "$PROFRAW_COUNT" -eq 0; then
-  err "No .profraw files generated."
-  err "Check that the binary is instrumented with -fprofile-instr-generate."
-  err "Use afl-cov-build.sh to build the coverage binary."
-  exit 1
-fi
-logv "Generated $PROFRAW_COUNT .profraw file(s)"
+  # ── merge profiles ─────────────────────────────────────────────────────────
+  log "Merging $PROFRAW_COUNT profile(s)..."
+  "$LLVM_PROFDATA" merge -sparse "$PROFRAW_DIR"/cov-*.profraw \
+    -o "$REPORT_DIR/coverage.profdata" || {
+    err "llvm-profdata merge failed"
+    exit 1
+  }
 
-# ── merge profiles ────────────────────────────────────────────────────────────
+  # ── generate reports ───────────────────────────────────────────────────────
+  local SHOW_OPTS=(
+    "$COV_BINARY"
+    "-instr-profile=$REPORT_DIR/coverage.profdata"
+    "-show-directory-coverage"
+    "-show-line-counts-or-regions"
+    "-show-branches=count"
+    "-ignore-filename-regex=$IGNORE_REGEX"
+  )
 
-log "Merging $PROFRAW_COUNT profile(s)..."
-"$LLVM_PROFDATA" merge -sparse "$PROFRAW_DIR"/cov-*.profraw \
-  -o "$REPORT_DIR/coverage.profdata" || {
-  err "llvm-profdata merge failed"
-  exit 1
+  log "Generating HTML report..."
+  "$LLVM_COV" show "${SHOW_OPTS[@]}" \
+    -format=html \
+    -output-dir="$REPORT_DIR/html" || {
+    err "llvm-cov show (HTML) failed"
+    exit 1
+  }
+
+  log "Generating text report..."
+  "$LLVM_COV" show "${SHOW_OPTS[@]}" \
+    -format=text \
+    -output-dir="$REPORT_DIR/text" || {
+    err "llvm-cov show (text) failed"
+    exit 1
+  }
+
+  log "Generating summary..."
+  "$LLVM_COV" report "$COV_BINARY" \
+    "-instr-profile=$REPORT_DIR/coverage.profdata" \
+    "-ignore-filename-regex=$IGNORE_REGEX" \
+    > "$REPORT_DIR/summary.txt" || {
+    err "llvm-cov report failed"
+    exit 1
+  }
+
+  test -s "$REPORT_DIR/coverage.json" && {
+    log "Creating backup of previous coverage.json -> coverage_old.json"
+    mv "$REPORT_DIR/coverage.json" "$REPORT_DIR/coverage_old.json"
+  }
+
+  log "Generating JSON export..."
+  "$LLVM_COV" export "$COV_BINARY" \
+    --format=text \
+    "-instr-profile=$REPORT_DIR/coverage.profdata" \
+    "-ignore-filename-regex=$IGNORE_REGEX" \
+    > "$REPORT_DIR/coverage.json" || {
+    err "llvm-cov export failed"
+    exit 1
+  }
+
+  # ── print summary ──────────────────────────────────────────────────────────
+  if test "$QUIET" -eq 0; then
+    echo ""
+    echo "=== Coverage Summary ==="
+    cat "$REPORT_DIR/summary.txt"
+    echo ""
+    echo "[+] HTML report  : file://$REPORT_DIR/html/index.html"
+    echo "[+] Text report  : $REPORT_DIR/text/"
+    echo "[+] Summary      : $REPORT_DIR/summary.txt"
+    echo "[+] JSON export  : $REPORT_DIR/coverage.json"
+    echo "[+] Profile data : $REPORT_DIR/coverage.profdata"
+  fi
 }
 
-# ── generate reports ──────────────────────────────────────────────────────────
+# ── main ──────────────────────────────────────────────────────────────────────
 
-# Common options for llvm-cov show
-SHOW_OPTS=(
-  "$COV_BINARY"
-  "-instr-profile=$REPORT_DIR/coverage.profdata"
-  "-show-directory-coverage"
-  "-show-line-counts-or-regions"
-  "-show-branches=count"
-  "-ignore-filename-regex=$IGNORE_REGEX"
-)
+test $# -eq 0 && { usage_main; exit 1; }
 
-log "Generating HTML report..."
-"$LLVM_COV" show "${SHOW_OPTS[@]}" \
-  -format=html \
-  -output-dir="$REPORT_DIR/html" || {
-  err "llvm-cov show (HTML) failed"
-  exit 1
-}
+# Global flags before command detection
+case "$1" in
+  -V) echo "afl-cov-$VERSION"; exit 0 ;;
+  -h|--help) usage_main; exit 0 ;;
+esac
 
-log "Generating text report..."
-"$LLVM_COV" show "${SHOW_OPTS[@]}" \
-  -format=text \
-  -output-dir="$REPORT_DIR/text" || {
-  err "llvm-cov show (text) failed"
-  exit 1
-}
+# Detect optional command; default to "report"
+COMMAND="report"
+case "$1" in
+  build|report|diff|stability) COMMAND="$1"; shift ;;
+esac
 
-log "Generating summary..."
-"$LLVM_COV" report "$COV_BINARY" \
-  "-instr-profile=$REPORT_DIR/coverage.profdata" \
-  "-ignore-filename-regex=$IGNORE_REGEX" \
-  > "$REPORT_DIR/summary.txt" || {
-  err "llvm-cov report failed"
-  exit 1
-}
-
-log "Generating JSON export..."
-"$LLVM_COV" export "$COV_BINARY" \
-  --format=text \
-  "-instr-profile=$REPORT_DIR/coverage.profdata" \
-  "-ignore-filename-regex=$IGNORE_REGEX" \
-  > "$REPORT_DIR/coverage.json" || {
-  err "llvm-cov export failed"
-  exit 1
-}
-
-# ── print summary ─────────────────────────────────────────────────────────────
-
-if test "$QUIET" -eq 0; then
-  echo ""
-  echo "=== Coverage Summary ==="
-  cat "$REPORT_DIR/summary.txt"
-  echo ""
-  echo "[+] HTML report  : file://$REPORT_DIR/html/index.html"
-  echo "[+] Text report  : $REPORT_DIR/text/"
-  echo "[+] Summary      : $REPORT_DIR/summary.txt"
-  echo "[+] JSON export  : $REPORT_DIR/coverage.json"
-  echo "[+] Profile data : $REPORT_DIR/coverage.profdata"
-fi
+case "$COMMAND" in
+  build)     cmd_build "$@" ;;
+  report)    cmd_report "$@" ;;
+  diff)      cmd_diff "$@" ;;
+  stability) cmd_stability "$@" ;;
+esac
