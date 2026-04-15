@@ -1,4 +1,4 @@
-# afl-cov - Fuzzing Code Coverage for AFL++, libFuzzer, and honggfuzz
+# cov-analysis - Fuzzing Code Coverage for AFL++, libFuzzer, and honggfuzz
 
 Version: 1.0.0
 
@@ -11,27 +11,27 @@ Version: 1.0.0
   - [Step 3: Diff Two Coverage Reports](#step-3-diff-two-coverage-reports)
   - [Parallelized AFL Execution](#parallelized-afl-execution)
 - [Usage Information](#usage-information)
-  - [afl-cov report (default)](#afl-cov-report-default)
-  - [afl-cov build](#afl-cov-build)
-  - [afl-cov driver](#afl-cov-driver)
-  - [afl-cov diff](#afl-cov-diff)
+  - [cov-analysis report (default)](#cov-analysis-report-default)
+  - [cov-analysis build](#cov-analysis-build)
+  - [cov-analysis driver](#cov-analysis-driver)
+  - [cov-analysis diff](#cov-analysis-diff)
 - [License](#license)
 
 ## Introduction
 
-`afl-cov` generates **LLVM source-based code coverage** reports from a fuzzing corpus. It auto-detects the on-disk layout used by [AFL++](https://github.com/AFLplusplus/AFLplusplus) (queue/crashes/timeouts directories, single or parallel), libFuzzer (flat corpus dir plus `crash-*`/`leak-*`/`oom-*` artifacts), and honggfuzz (flat corpus plus `SIG*.fuzz` crash files). It replays each input through a coverage-instrumented binary, merges the raw profiles, and produces HTML, text, and JSON reports via `llvm-profdata` and `llvm-cov`.
+`cov-analysis` generates **LLVM source-based code coverage** reports from a fuzzing corpus. It auto-detects the on-disk layout used by [AFL++](https://github.com/AFLplusplus/AFLplusplus) (queue/crashes/timeouts directories, single or parallel), libFuzzer (flat corpus dir plus `crash-*`/`leak-*`/`oom-*` artifacts), and honggfuzz (flat corpus plus `SIG*.fuzz` crash files). It replays each input through a coverage-instrumented binary, merges the raw profiles, and produces HTML, text, and JSON reports via `llvm-profdata` and `llvm-cov`.
 
-This is a rewrite of the original afl-cov. Key changes in 1.0.0:
+This is a rewrite of the original cov-analysis. Key changes in 1.0.0:
 - Replaced gcov/lcov/genhtml with LLVM source-based coverage (`-fprofile-instr-generate`, `llvm-profdata`, `llvm-cov`) - faster, more accurate under optimization
 - Rewritten in bash (was Python)
-- `afl-cov build` sets compiler flags and builds the target; `afl-cov driver` emits a ready-to-use `coverage_driver.c` for `LLVMFuzzerTestOneInput` harnesses
-- `afl-cov diff` generates an HTML diff report comparing coverage between two JSON exports
+- `cov-analysis build` sets compiler flags and builds the target; `cov-analysis driver` emits a ready-to-use `coverage_driver.c` for `LLVMFuzzerTestOneInput` harnesses
+- `cov-analysis diff` generates an HTML diff report comparing coverage between two JSON exports
 
 ## Prerequisites
 
 - `clang` (any version down to 11)
 - `llvm-profdata` and `llvm-cov` (matching the clang version; auto-detected)
-- AFL++ (`afl-fuzz`), libfuzzer, Honggfuzz - only needed to produce the corpus, not to run `afl-cov`
+- AFL++ (`afl-fuzz`), libfuzzer, Honggfuzz - only needed to produce the corpus, not to run `cov-analysis`
 
 ## Supported Fuzzers
 
@@ -49,16 +49,16 @@ Override auto-detection with `--layout afl|flat`.
 
 ### Step 1: Build a Coverage Binary
 
-Use `afl-cov build` to set the correct compiler flags and build your target:
+Use `cov-analysis build` to set the correct compiler flags and build your target:
 
 ```bash
 # Set up a coverage build (run once per build step)
 cd /path/to/project-cov/
-afl-cov build ./configure --disable-shared
-afl-cov build make -j$(nproc)
+cov-analysis build ./configure --disable-shared
+cov-analysis build make -j$(nproc)
 ```
 
-`afl-cov build` sets:
+`cov-analysis build` sets:
 ```
 CC=clang  CXX=clang++
 CFLAGS="-fprofile-instr-generate -fcoverage-mapping -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION=1"
@@ -72,7 +72,7 @@ LDFLAGS="-fprofile-instr-generate"
 Generate a replay driver and link it against your coverage-instrumented library:
 
 ```bash
-afl-cov driver -o coverage_driver.c
+cov-analysis driver -o coverage_driver.c
 clang -fprofile-instr-generate -fcoverage-mapping \
   -c coverage_driver.c -o coverage_driver.o
 clang -fprofile-instr-generate \
@@ -85,22 +85,22 @@ The driver loops over all file arguments, calls `LLVMFuzzerTestOneInput` for eac
 
 ```bash
 cd /path/to/project-cov/
-afl-cov -d /path/to/afl-fuzz-output/ -e "./cov @@"
+cov-analysis -d /path/to/afl-fuzz-output/ -e "./cov @@"
 ```
 
 To replay coverage with multiple workers, add `-t`:
 
 ```bash
-afl-cov -d /path/to/afl-fuzz-output/ -e "./cov @@" -t 8
+cov-analysis -d /path/to/afl-fuzz-output/ -e "./cov @@" -t 8
 ```
 
-`afl-cov` will for AFL++:
+`cov-analysis` will for AFL++:
 1. Replay all `queue/id:*` files in batch (fast)
 2. Replay `crashes/id:*` and `timeouts/id:*` one-by-one with a timeout
 3. Merge `.profraw` profiles with `llvm-profdata`
 4. Generate reports in `/path/to/afl-fuzz-output/cov/`
 
-For libfuzzer/Honggfuzz `afl-cov` will:
+For libfuzzer/Honggfuzz `cov-analysis` will:
 1. Replay all files in the directory
 2. Crash files are replayed one-by-one with a timeout
 
@@ -117,13 +117,13 @@ Output:
 For stdin-based targets (binary reads from stdin, no file argument):
 
 ```bash
-afl-cov -d /path/to/afl-fuzz-output/ -e "./target"
+cov-analysis -d /path/to/afl-fuzz-output/ -e "./target"
 ```
 
 #### libFuzzer corpus
 
 ```bash
-afl-cov -d /path/to/libfuzzer-corpus/ -e "./cov @@"
+cov-analysis -d /path/to/libfuzzer-corpus/ -e "./cov @@"
 ```
 
 Corpus files are replayed in batch mode. If your libFuzzer run used `-artifact_prefix=./crashes/`, point a second run at that directory to cover crash inputs too — or move artifacts into the corpus dir beforehand.
@@ -131,7 +131,7 @@ Corpus files are replayed in batch mode. If your libFuzzer run used `-artifact_p
 #### honggfuzz workspace
 
 ```bash
-afl-cov -d /path/to/hfuzz-workdir/ -e "./cov @@"
+cov-analysis -d /path/to/hfuzz-workdir/ -e "./cov @@"
 ```
 
 `SIG*.fuzz` crash files are replayed under the `-T` timeout. The `HONGGFUZZ.REPORT.TXT` metadata file is ignored automatically.
@@ -141,7 +141,7 @@ afl-cov -d /path/to/hfuzz-workdir/ -e "./cov @@"
 Compare coverage between two `llvm-cov` JSON exports and generate an HTML diff report:
 
 ```bash
-afl-cov diff coverage_old.json coverage_new.json
+cov-analysis diff coverage_old.json coverage_new.json
 ```
 
 The report is written to `<report-dir>/coverage_diff.html` and shows:
@@ -149,22 +149,22 @@ The report is written to `<report-dir>/coverage_diff.html` and shows:
 - Newly covered and lost functions
 - Source code snippets annotated with coverage change
 
-If the JSON paths are omitted, `afl-cov diff` defaults to `<report-dir>/coverage_old.json` and `<report-dir>/coverage.json`.
+If the JSON paths are omitted, `cov-analysis diff` defaults to `<report-dir>/coverage_old.json` and `<report-dir>/coverage.json`.
 
 ### Parallelized AFL Execution
 
-For parallel AFL runs (`afl-fuzz -o sync_dir`), point `-d` at the top-level sync directory. `afl-cov` automatically discovers all fuzzer instance subdirectories:
+For parallel AFL runs (`afl-fuzz -o sync_dir`), point `-d` at the top-level sync directory. `cov-analysis` automatically discovers all fuzzer instance subdirectories:
 
 ```bash
-afl-cov -d /path/to/sync_dir/ -e "./cov @@"
+cov-analysis -d /path/to/sync_dir/ -e "./cov @@"
 ```
 
 ## Usage Information
 
-### afl-cov report (default)
+### cov-analysis report (default)
 
 ```
-Usage: afl-cov [report] [options]
+Usage: cov-analysis [report] [options]
 
 Required:
   -d <dir>    Fuzzing output directory (AFL++, libFuzzer, or honggfuzz)
@@ -184,19 +184,19 @@ Optional:
   -h, --help         Print this help and exit
 ```
 
-### afl-cov build
+### cov-analysis build
 
 ```
-Usage: afl-cov build <build-command> [args...]
+Usage: cov-analysis build <build-command> [args...]
 
   Sets CC/CXX/CFLAGS/CXXFLAGS/LDFLAGS for LLVM source-based coverage and
   runs the given build command.
 ```
 
-### afl-cov driver
+### cov-analysis driver
 
 ```
-Usage: afl-cov driver [-o output.c]
+Usage: cov-analysis driver [-o output.c]
 
   Emits coverage_driver.c source to stdout (or to -o FILE).
   Use this for LLVMFuzzerTestOneInput harnesses to replay corpus files.
@@ -209,10 +209,10 @@ Options:
   -o <file>     Write driver source to FILE instead of stdout
 ```
 
-### afl-cov diff
+### cov-analysis diff
 
 ```
-Usage: afl-cov diff [<OLD_JSON> <NEW_JSON>]
+Usage: cov-analysis diff [<OLD_JSON> <NEW_JSON>]
 
   Compare coverage between two llvm-cov JSON exports and generate an
   HTML diff report showing newly covered, lost, and still-uncovered
@@ -231,4 +231,4 @@ afl-stat.sh /path/to/afl-fuzz-output/
 
 ## License
 
-`afl-cov` is released under the **GNU Affero General Public License 3.0**.
+`cov-analysis` is released under the **GNU Affero General Public License 3.0**.
