@@ -92,8 +92,8 @@ The driver loops over all file arguments, calls `LLVMFuzzerTestOneInput` for eac
 
 This step produces an `llvm-cov` coverage report with regions and branches:
 
-![report overview](report-overview.png)
-![report detail](report-detail.png)
+<img align="left" src="https://raw.githubusercontent.com/AFLplusplus/cov-analysis/main/report-overview.png" alt="report overview">
+<img align="left" src="https://raw.githubusercontent.com/AFLplusplus/cov-analysis/main/report-detail.png" alt="report detail">
 
 ```bash
 cd /path/to/project-cov/
@@ -167,9 +167,8 @@ If the JSON paths are omitted, `cov-analysis diff` defaults to `<report-dir>/cov
 
 The HTML diff report looks like this:
 
-![diff overview](diff-overview.png)
-
-![diff detail](diff-detail.png)
+<img align="left" src="https://raw.githubusercontent.com/AFLplusplus/cov-analysis/main/diff-overview.png" alt="diff overview">
+<img align="left" src="https://raw.githubusercontent.com/AFLplusplus/cov-analysis/main/diff-detail.png" alt="diff detail">
 
 ### Step 4: Identifying unstable code lines
 
