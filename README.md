@@ -1,4 +1,4 @@
-# cov-analysis - Fuzzing Code Coverage for AFL++, libFuzzer, and honggfuzz
+# cov-analysis - Fuzzing Code Coverage for AFL++, libFuzzer, libafl, and honggfuzz
 
 Replacing `afl-cov` and `libfuzzer-cov` with modern coverage gathering and great features!
 
@@ -23,7 +23,7 @@ Version: 1.0.0
 
 ## Introduction
 
-`cov-analysis` generates **LLVM source-based code coverage** reports from a fuzzing corpus. It auto-detects the on-disk layout used by [AFL++](https://github.com/AFLplusplus/AFLplusplus) (queue/crashes/timeouts directories, single or parallel), libFuzzer (flat corpus dir plus `crash-*`/`leak-*`/`oom-*` artifacts), and honggfuzz (flat corpus plus `SIG*.fuzz` crash files). It replays each input through a coverage-instrumented binary, merges the raw profiles, and produces HTML, text, and JSON reports via `llvm-profdata` and `llvm-cov`.
+`cov-analysis` generates **LLVM source-based code coverage** reports from a fuzzing corpus. It auto-detects the on-disk layout used by [AFL++](https://github.com/AFLplusplus/AFLplusplus) (queue/crashes/timeouts directories, single or parallel), libFuzzer and libafl (flat corpus dir plus `crash-*`/`leak-*`/`oom-*` artifacts), and honggfuzz (flat corpus plus `SIG*.fuzz` crash files). It replays each input through a coverage-instrumented binary, merges the raw profiles, and produces HTML, text, and JSON reports via `llvm-profdata` and `llvm-cov`.
 
 This is a rewrite of the original cov-analysis. Key changes in 1.0.0:
 - New: diff reports comparing coverage between two runs
@@ -113,7 +113,7 @@ cov-analysis -d /path/to/afl-fuzz-output/ -e "./cov @@" -t 8
 3. Merge `.profraw` profiles with `llvm-profdata`
 4. Generate reports in `/path/to/afl-fuzz-output/cov/`
 
-For libfuzzer/Honggfuzz `cov-analysis` will:
+For libfuzzer/libafl/Honggfuzz `cov-analysis` will:
 1. Replay all files in the directory
 2. Crash files are replayed one-by-one with a timeout
 
@@ -219,7 +219,7 @@ cov-analysis -d /path/to/sync_dir/ -e "./cov @@"
 Usage: cov-analysis [report] [options]
 
 Required:
-  -d <dir>    Fuzzing output directory (AFL++, libFuzzer, or honggfuzz)
+  -d <dir>    Fuzzing output directory (AFL++, libFuzzer, libafl, or honggfuzz)
   -e <cmd>    Coverage command. Use @@ as input file placeholder.
               Omit @@ to feed input via stdin instead.
 
@@ -284,7 +284,7 @@ Usage: cov-analysis stability [options]
   4 runs, reruns for a total of 8 to confirm.
 
 Required:
-  -d <dir>    Fuzzing output directory (AFL++, libFuzzer, or honggfuzz)
+  -d <dir>    Fuzzing output directory (AFL++, libFuzzer, libafl, or honggfuzz)
   -e <cmd>    Coverage command. Use @@ as input file placeholder.
               Omit @@ to feed input via stdin instead.
 
