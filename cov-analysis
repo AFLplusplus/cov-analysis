@@ -28,6 +28,20 @@ log()  { test "$QUIET" -eq 0 && echo "[+] $*" || true; }
 logv() { test "$VERBOSE" -eq 1 && echo "[*] $*" || true; }
 err()  { echo "[-] $*" >&2; }
 
+# Validate an option's value. Prints error and exits 1 if $2 is missing or
+# begins with '-'. Usage: need_arg <opt-name> <value-or-empty>
+need_arg() {
+  local opt="$1" val="${2-}"
+  if test -z "$val"; then
+    err "Option $opt requires an argument"
+    exit 1
+  fi
+  case "$val" in
+    -*) err "Option $opt requires an argument (got '$val' which looks like a flag)"
+        exit 1 ;;
+  esac
+}
+
 # Find an LLVM tool by bare name, then versioned (20 down to 11)
 find_tool() {
   local tool="$1"
@@ -48,14 +62,18 @@ find_tool() {
 # Skips leading KEY=VALUE env assignments and @@ placeholders.
 extract_binary() {
   local cmd="$1"
-  local token
+  local token rc=1
+  # Disable pathname expansion so `*`, `?`, `[` in the command string do not
+  # pick up files from the cwd while we tokenize on whitespace.
+  set -f
   for token in $cmd; do
     case "$token" in
       *=*|@@) continue ;;
-      *)      echo "$token"; return 0 ;;
+      *)      echo "$token"; rc=0; break ;;
     esac
   done
-  return 1
+  set +f
+  return $rc
 }
 
 # Classify $AFL_DIR as one of:
@@ -80,8 +98,15 @@ detect_fuzzer_layout() {
 find_queue_files() {
   case "${FUZZER_LAYOUT:-afl}" in
     afl)
-      find "$AFL_DIR/queue" "$AFL_DIR"/*/queue \
-        -name 'id:*' -print0 2>/dev/null || true
+      local paths=()
+      test -d "$AFL_DIR/queue" && paths+=("$AFL_DIR/queue")
+      local p
+      shopt -s nullglob
+      for p in "$AFL_DIR"/*/queue; do paths+=("$p"); done
+      shopt -u nullglob
+      if test "${#paths[@]}" -gt 0; then
+        find "${paths[@]}" -name 'id:*' -print0 2>/dev/null || true
+      fi
       ;;
     flat)
       # libFuzzer/libafl/honggfuzz flat corpus: every regular file that isn't a
@@ -104,9 +129,17 @@ find_queue_files() {
 find_crash_timeout_files() {
   case "${FUZZER_LAYOUT:-afl}" in
     afl)
-      find "$AFL_DIR/crashes" "$AFL_DIR"/*/crashes \
-           "$AFL_DIR/timeouts" "$AFL_DIR"/*/timeouts \
-        -name 'id:*' -print0 2>/dev/null || true
+      local paths=()
+      test -d "$AFL_DIR/crashes"  && paths+=("$AFL_DIR/crashes")
+      test -d "$AFL_DIR/timeouts" && paths+=("$AFL_DIR/timeouts")
+      local p
+      shopt -s nullglob
+      for p in "$AFL_DIR"/*/crashes  ; do paths+=("$p"); done
+      for p in "$AFL_DIR"/*/timeouts ; do paths+=("$p"); done
+      shopt -u nullglob
+      if test "${#paths[@]}" -gt 0; then
+        find "${paths[@]}" -name 'id:*' -print0 2>/dev/null || true
+      fi
       ;;
     flat)
       # libFuzzer artifacts (crash-*/leak-*/oom-*/timeout-*/slow-unit-*)
@@ -154,7 +187,7 @@ extern int __llvm_profile_write_file(void);
 
 static void crash_handler(int sig) {
     __llvm_profile_write_file();
-    fprintf(stderr, "ERROR: Coverage gathering aborted due signal!\n");
+    fprintf(stderr, "ERROR: Coverage gathering aborted due to signal!\n");
     raise(sig);
 }
 
@@ -327,7 +360,7 @@ EOF
 
 usage_diff() {
   cat << 'EOF'
-Usage: cov-analysis diff [<OLD_JSON> <NEW_JSON>]
+Usage: cov-analysis diff [-o <report-dir>] [<OLD_JSON> <NEW_JSON>]
 
   Compare coverage between two llvm-cov JSON exports and generate an
   HTML diff report showing newly covered, lost, and still-uncovered
@@ -340,6 +373,8 @@ Usage: cov-analysis diff [<OLD_JSON> <NEW_JSON>]
               (default: <report-dir>/coverage.json)
 
 Options:
+  -o <dir>    Report directory for default-path lookups and HTML output
+              (default: .). The HTML is written to <dir>/coverage_diff.html.
   -h, --help  Print this help and exit
 EOF
 }
@@ -354,7 +389,7 @@ Usage: cov-analysis stability [options]
   4 runs, reruns for a total of 8 to confirm.
 
 Required:
-  -d <dir>    Fuzzing output directory (AFL++, libFuzzer, libaf, or honggfuzz)
+  -d <dir>    Fuzzing output directory (AFL++, libFuzzer, libafl, or honggfuzz)
   -e <cmd>    Coverage command. Use @@ as input file placeholder.
               Omit @@ to feed input via stdin instead.
 
@@ -363,6 +398,7 @@ Optional:
   -s <prefix>        Only consider source lines whose file path contains
                      this prefix (e.g. -s src/)
   -t <num>           Parallel replay workers (default: 1)
+  -T <secs>          Per-input timeout in seconds (default: 5)
   --layout <kind>    Force layout: 'afl' or 'flat' (default: auto-detect)
   -v                 Verbose output
   -q                 Quiet mode (suppress all [+] output)
@@ -385,11 +421,18 @@ cmd_build() {
     -V)        echo "cov-analysis-$VERSION"; exit 0 ;;
   esac
 
-  # Build mode: refuse if an AFL++ compiler is already set
-  echo " ${CC-} ${CXX-}" | grep -q afl && {
-    err "AFL++ compiler is set in CC/CXX — unset it before building a coverage binary."
-    exit 1
-  }
+  # Build mode: refuse if an AFL++ compiler is already set. Match on basename
+  # against the known afl-* wrappers rather than a substring search, so paths
+  # like /opt/waffle/bin/clang do not trigger a false positive.
+  local _cc_base _cxx_base
+  _cc_base="$(basename -- "${CC-}" 2>/dev/null || true)"
+  _cxx_base="$(basename -- "${CXX-}" 2>/dev/null || true)"
+  case "$_cc_base $_cxx_base" in
+    *afl-clang*|*afl-gcc*|*afl-g++*|*afl-cc*|*afl-c++*)
+      err "AFL++ compiler is set in CC/CXX — unset it before building a coverage binary."
+      exit 1
+      ;;
+  esac
 
   # Auto-detect clang if CC/CXX not set
   if test -z "${CC-}"; then
@@ -430,7 +473,7 @@ cmd_driver() {
   esac
 
   if test "${1-}" = "-o"; then
-    test -z "${2-}" && { err "-o requires a filename"; exit 1; }
+    need_arg "-o" "${2-}"
     emit_driver > "$2"
     echo "[+] coverage_driver.c written to: $2" >&2
   else
@@ -447,26 +490,30 @@ cmd_stability() {
   local RUNS=4
   local SOURCE_FILTER=""
   local FORKS=1
+  local TIMEOUT=5
   local LLVM_PROFDATA=""
   local LLVM_COV=""
   local STAB_DIR=""
   local COV_BINARY=""
   local USER_RUNS=""   # set if -n was explicitly provided
+  local FUZZER_LAYOUT="${FUZZER_LAYOUT:-}"
+  local GAWK=""
 
   if test $# -eq 0; then usage_stability; exit 1; fi
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      -d)        AFL_DIR="$2";                  shift 2 ;;
-      -e)        COVERAGE_CMD="$2";             shift 2 ;;
-      -n)        RUNS="$2"; USER_RUNS="1";      shift 2 ;;
-      -s)        SOURCE_FILTER="$2";            shift 2 ;;
-      -t)        FORKS="$2";                    shift 2 ;;
+      -d)        need_arg "-d" "${2-}"; AFL_DIR="$2";                  shift 2 ;;
+      -e)        need_arg "-e" "${2-}"; COVERAGE_CMD="$2";             shift 2 ;;
+      -n)        need_arg "-n" "${2-}"; RUNS="$2"; USER_RUNS="1";      shift 2 ;;
+      -s)        need_arg "-s" "${2-}"; SOURCE_FILTER="$2";            shift 2 ;;
+      -t)        need_arg "-t" "${2-}"; FORKS="$2";                    shift 2 ;;
+      -T)        need_arg "-T" "${2-}"; TIMEOUT="$2";                  shift 2 ;;
       -v)        VERBOSE=1;                     shift   ;;
       -q)        QUIET=1;                       shift   ;;
       -V)        echo "cov-analysis-$VERSION"; exit 0 ;;
       -h|--help) usage_stability; exit 0 ;;
-      --layout)  FUZZER_LAYOUT="$2";            shift 2 ;;
+      --layout)  need_arg "--layout" "${2-}"; FUZZER_LAYOUT="$2";      shift 2 ;;
       *) err "Unknown option: $1"; echo "" >&2; usage_stability >&2; exit 1 ;;
     esac
   done
@@ -493,6 +540,12 @@ cmd_stability() {
   case "$FORKS" in
     ''|*[!0-9]*|0)
       err "Replay worker count must be a positive integer: $FORKS"
+      exit 1
+      ;;
+  esac
+  case "$TIMEOUT" in
+    ''|*[!0-9]*|0)
+      err "Timeout (-T) must be a positive integer in seconds: $TIMEOUT"
       exit 1
       ;;
   esac
@@ -525,6 +578,20 @@ cmd_stability() {
     exit 1
   }
   log "LLVM tools      : $LLVM_PROFDATA, $LLVM_COV"
+
+  # Stability aggregation needs gawk (multi-dim arrays, ARGIND). mawk and
+  # busybox awk will not work. Prefer an explicit `gawk` binary if the
+  # system `awk` is not gawk.
+  if awk --version 2>/dev/null | grep -qi '^GNU Awk'; then
+    GAWK="awk"
+  elif command -v gawk >/dev/null 2>&1; then
+    GAWK="gawk"
+  else
+    err "cov-analysis stability requires GNU awk (gawk)."
+    err "Install it (apt install gawk / dnf install gawk)."
+    exit 1
+  fi
+  logv "Using gawk      : $GAWK"
 
   # ── detect or honor fuzzer layout ──────────────────────────────────────────
   if test -z "$FUZZER_LAYOUT"; then
@@ -570,25 +637,23 @@ cmd_stability() {
     log "Collecting pass $idx/$RUNS..."
     export LLVM_PROFILE_FILE="$run_dir/cov-%p.profraw"
 
-    if echo "$COVERAGE_CMD" | grep -q '@@'; then
-      find_queue_files | xargs -0 -r -n 1 -P "$FORKS" \
-        bash -c '
-          coverage_cmd="$1"
-          f="$2"
-          cmd="${coverage_cmd/@@/$f}"
-          sh -c "$cmd" >/dev/null 2>&1 || true
-        ' _ "$COVERAGE_CMD"
-    else
-      find_queue_files | xargs -0 -r -n 1 -P "$FORKS" \
-        bash -c '
-          coverage_cmd="$1"
-          f="$2"
-          sh -c "$coverage_cmd" < "$f" >/dev/null 2>&1 || true
-        ' _ "$COVERAGE_CMD"
-    fi
+    case "$COVERAGE_CMD" in
+      *@@*)
+        find_queue_files | xargs -0 -r -n 1 -P "$FORKS" \
+          bash -c 'timeout --signal=SIGTERM "${2}s" bash -c "${1/@@/$3}"' \
+          _ "$COVERAGE_CMD" "$TIMEOUT" \
+          >/dev/null 2>&1 || true
+        ;;
+      *)
+        find_queue_files | xargs -0 -r -n 1 -P "$FORKS" \
+          bash -c 'timeout --signal=SIGTERM "${2}s" bash -c "$1" < "$3"' \
+          _ "$COVERAGE_CMD" "$TIMEOUT" \
+          >/dev/null 2>&1 || true
+        ;;
+    esac
 
     local profraw_count
-    profraw_count=$(find "$run_dir" -name '*.profraw' 2>/dev/null | wc -l)
+    profraw_count=$(find "$run_dir" -name '*.profraw' -printf . 2>/dev/null | wc -c)
     if test "$profraw_count" -eq 0; then
       err "No .profraw files generated in pass $idx."
       err "Check that the binary is instrumented with -fprofile-instr-generate."
@@ -640,7 +705,7 @@ cmd_stability() {
     for i in $(seq 1 "$n"); do
       hit_files+=("$STAB_DIR/run_${i}.hits")
     done
-    awk -v n="$n" '
+    "$GAWK" -v n="$n" '
       { counts[$1][ARGIND] = $2 }
       END {
         total = 0; stable_count = 0
@@ -668,6 +733,7 @@ cmd_stability() {
   stable_count=$(printf '%s\n' "$analysis_out" | awk '/^STABILITY_STATS/{print $2}')
   total_lines=$(printf '%s\n'  "$analysis_out" | awk '/^STABILITY_STATS/{print $3}')
   unstable_lines="$(printf '%s\n' "$analysis_out" | grep -v '^STABILITY_STATS' | sort -V)"
+  : "${stable_count:=0}" "${total_lines:=0}"
 
   # ── extend to double the runs if instability found (default -n only) ───────
   if test -n "$unstable_lines" && test -z "$USER_RUNS"; then
@@ -683,6 +749,7 @@ cmd_stability() {
     stable_count=$(printf '%s\n' "$analysis_out" | awk '/^STABILITY_STATS/{print $2}')
     total_lines=$(printf '%s\n'  "$analysis_out" | awk '/^STABILITY_STATS/{print $3}')
     unstable_lines="$(printf '%s\n' "$analysis_out" | grep -v '^STABILITY_STATS' | sort -V)"
+    : "${stable_count:=0}" "${total_lines:=0}"
   fi
 
   # ── collapse consecutive unstable lines into ranges ────────────────────────
@@ -753,7 +820,7 @@ cmd_stability() {
 cmd_diff() {
   local REPORT_DIR="."
   case "${1-}" in
-    -o)        REPORT_DIR="$2"; shift 2 ;;
+    -o)        need_arg "-o" "${2-}"; REPORT_DIR="$2"; shift 2 ;;
     -h|--help) usage_diff; exit 0 ;;
     -V)        echo "cov-analysis-$VERSION"; exit 0 ;;
   esac
@@ -1222,30 +1289,31 @@ cmd_report() {
   local PROFRAW_DIR=""
   local LLVM_PROFDATA=""
   local LLVM_COV=""
+  local FUZZER_LAYOUT="${FUZZER_LAYOUT:-}"
 
   # ── argument parsing ───────────────────────────────────────────────────────
   if test $# -eq 0; then usage_report; exit 1; fi
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      -d)            AFL_DIR="$2";       shift 2 ;;
-      -e)            COVERAGE_CMD="$2";  shift 2 ;;
-      -o)            REPORT_DIR="$2";    shift 2 ;;
-      -t)            FORKS="$2";         shift 2 ;;
-      -T)            TIMEOUT="$2";       shift 2 ;;
+      -d)            need_arg "-d" "${2-}"; AFL_DIR="$2";       shift 2 ;;
+      -e)            need_arg "-e" "${2-}"; COVERAGE_CMD="$2";  shift 2 ;;
+      -o)            need_arg "-o" "${2-}"; REPORT_DIR="$2";    shift 2 ;;
+      -t)            need_arg "-t" "${2-}"; FORKS="$2";         shift 2 ;;
+      -T)            need_arg "-T" "${2-}"; TIMEOUT="$2";       shift 2 ;;
       -v)            VERBOSE=1;          shift   ;;
       -q)            QUIET=1;            shift   ;;
       -V)            echo "cov-analysis-$VERSION"; exit 0 ;;
       -h|--help)     usage_report; exit 0 ;;
-      --ignore-regex) IGNORE_REGEX="$2"; shift 2 ;;
-      --layout)      FUZZER_LAYOUT="$2";  shift 2 ;;
+      --ignore-regex) need_arg "--ignore-regex" "${2-}"; IGNORE_REGEX="$2"; shift 2 ;;
+      --layout)      need_arg "--layout" "${2-}"; FUZZER_LAYOUT="$2";       shift 2 ;;
       *) err "Unknown option: $1"; echo "" >&2; usage_report >&2; exit 1 ;;
     esac
   done
 
   # ── validate inputs ────────────────────────────────────────────────────────
   if test -z "$AFL_DIR"; then
-    err "Must specify input directory with -d (AFL++, libFuzzer, libafl, libafl, or honggfuzz)"
+    err "Must specify input directory with -d (AFL++, libFuzzer, libafl, or honggfuzz)"
     exit 1
   fi
   if test -z "$COVERAGE_CMD"; then
@@ -1259,6 +1327,12 @@ cmd_report() {
   case "$FORKS" in
     ''|*[!0-9]*|0)
       err "Replay worker count must be a positive integer: $FORKS"
+      exit 1
+      ;;
+  esac
+  case "$TIMEOUT" in
+    ''|*[!0-9]*|0)
+      err "Timeout (-T) must be a positive integer in seconds: $TIMEOUT"
       exit 1
       ;;
   esac
@@ -1316,6 +1390,26 @@ cmd_report() {
   PROFRAW_DIR="$(mktemp -d /tmp/cov-analysis-profraw.XXXXXX)"
   trap "rm -rf '$PROFRAW_DIR'" EXIT INT TERM
 
+  # Guard against nuking the filesystem root or a bare "./html" / "./text"
+  # that might belong to something else in cwd.
+  local _abs_report
+  _abs_report="$(cd "$REPORT_DIR" 2>/dev/null && pwd -P || echo "$REPORT_DIR")"
+  case "$_abs_report" in
+    /|""|"/usr"|"/usr/local"|"/etc"|"/var"|"/opt"|"/home"|"/root")
+      err "Refusing to use report directory: $REPORT_DIR (resolves to '$_abs_report')."
+      err "Pick a dedicated subdirectory with -o."
+      exit 1
+      ;;
+  esac
+  if test "$_abs_report" = "$PWD" && { test -e "$REPORT_DIR/html" || test -e "$REPORT_DIR/text"; }; then
+    if ! test -f "$REPORT_DIR/summary.txt" && ! test -f "$REPORT_DIR/coverage.profdata"; then
+      err "Refusing to delete '$REPORT_DIR/html' / '$REPORT_DIR/text' — they do not look"
+      err "like a previous cov-analysis report (no summary.txt / coverage.profdata)."
+      err "Pick a different -o directory."
+      exit 1
+    fi
+  fi
+
   rm -rf "$REPORT_DIR/html" "$REPORT_DIR/text"
   mkdir -p "$REPORT_DIR/html" "$REPORT_DIR/text"
   export LLVM_PROFILE_FILE="$PROFRAW_DIR/cov-%p.profraw"
@@ -1330,72 +1424,66 @@ cmd_report() {
   QUEUE_COUNT=$(count_files find_queue_files)
   log "Replaying $QUEUE_COUNT queue files..."
 
-  if echo "$COVERAGE_CMD" | grep -q '@@'; then
-    # Determine if @@ is the last token (enables fast batch mode)
-    local LAST_TOKEN="${COVERAGE_CMD##* }"
-    if test "$LAST_TOKEN" = "@@"; then
-      if ! grep -qaF '###SIGNATURE_LLVMFUZZERTESTONEINPUT_COVERAGE###' "$COV_BINARY" 2>/dev/null; then
-        LAST_TOKEN="x"
+  case "$COVERAGE_CMD" in
+    *@@*)
+      # Determine if @@ is the last token (enables fast batch mode)
+      local LAST_TOKEN="${COVERAGE_CMD##* }"
+      if test "$LAST_TOKEN" = "@@"; then
+        if ! grep -qaF '###SIGNATURE_LLVMFUZZERTESTONEINPUT_COVERAGE###' "$COV_BINARY" 2>/dev/null; then
+          LAST_TOKEN="x"
+        fi
       fi
-    fi
-    if test "$LAST_TOKEN" = "@@"; then
-      # Fast batch: strip trailing @@ and let xargs append all files at once.
-      # sh -c handles env assignments (e.g. LD_LIBRARY_PATH=./lib ./cov) correctly.
-      local CMD_NO_AT="${COVERAGE_CMD% @@}"
-      logv "Queue replay: batch (xargs, workers=$FORKS)"
-      # shellcheck disable=SC2016
-      find_queue_files | xargs -0 -r -n 128 -P "$FORKS" \
-        sh -c "${CMD_NO_AT}"' "$@"' -- >/dev/null 2>&1 || true
-    else
-      # @@ is embedded mid-command (e.g. "./cov -f @@ -extra") — loop mode
-      logv "Queue replay: loop (mid-command @@, workers=$FORKS)"
+      if test "$LAST_TOKEN" = "@@"; then
+        # Fast batch: strip trailing @@ and let xargs append all files at once.
+        # sh -c handles env assignments (e.g. LD_LIBRARY_PATH=./lib ./cov) correctly.
+        local CMD_NO_AT="${COVERAGE_CMD% @@}"
+        logv "Queue replay: batch (xargs, workers=$FORKS)"
+        # shellcheck disable=SC2016
+        find_queue_files | xargs -0 -r -n 128 -P "$FORKS" \
+          sh -c "${CMD_NO_AT}"' "$@"' -- >/dev/null 2>&1 || true
+      else
+        # @@ is embedded mid-command (e.g. "./cov -f @@ -extra") — loop mode.
+        # Collapse bash -c + sh -c into a single bash -c that evals the
+        # substituted command (one fork per file instead of two).
+        logv "Queue replay: loop (mid-command @@, workers=$FORKS)"
+        find_queue_files | xargs -0 -r -n 1 -P "$FORKS" \
+          bash -c 'eval "${1/@@/$2}"' _ "$COVERAGE_CMD" \
+          >/dev/null 2>&1 || true
+      fi
+      ;;
+    *)
+      # No @@ — feed each file via stdin
+      logv "Queue replay: stdin loop (workers=$FORKS)"
       find_queue_files | xargs -0 -r -n 1 -P "$FORKS" \
-        bash -c '
-          coverage_cmd="$1"
-          f="$2"
-          cmd="${coverage_cmd/@@/$f}"
-          sh -c "$cmd" >/dev/null 2>&1 || true
-        ' _ "$COVERAGE_CMD"
-    fi
-  else
-    # No @@ — feed each file via stdin
-    logv "Queue replay: stdin loop (workers=$FORKS)"
-    find_queue_files | xargs -0 -r -n 1 -P "$FORKS" \
-      bash -c '
-        coverage_cmd="$1"
-        f="$2"
-        sh -c "$coverage_cmd" < "$f" >/dev/null 2>&1 || true
-      ' _ "$COVERAGE_CMD"
-  fi
+        bash -c 'eval "$1" < "$2"' _ "$COVERAGE_CMD" \
+        >/dev/null 2>&1 || true
+      ;;
+  esac
 
   # ── replay crashes and timeouts ────────────────────────────────────────────
   local CRASH_COUNT
   CRASH_COUNT=$(count_files find_crash_timeout_files)
   if test "$CRASH_COUNT" -gt 0; then
     log "Replaying $CRASH_COUNT crash/timeout files (timeout=${TIMEOUT}s each)..."
-    if echo "$COVERAGE_CMD" | grep -q '@@'; then
-      find_crash_timeout_files | xargs -0 -r -n 1 -P "$FORKS" \
-        bash -c '
-          coverage_cmd="$1"
-          timeout_secs="$2"
-          f="$3"
-          cmd="${coverage_cmd/@@/$f}"
-          timeout --signal=SIGTERM "${timeout_secs}s" sh -c "$cmd" >/dev/null 2>&1 || true
-        ' _ "$COVERAGE_CMD" "$TIMEOUT"
-    else
-      find_crash_timeout_files | xargs -0 -r -n 1 -P "$FORKS" \
-        bash -c '
-          coverage_cmd="$1"
-          timeout_secs="$2"
-          f="$3"
-          timeout --signal=SIGTERM "${timeout_secs}s" sh -c "$coverage_cmd" < "$f" >/dev/null 2>&1 || true
-        ' _ "$COVERAGE_CMD" "$TIMEOUT"
-    fi
+    case "$COVERAGE_CMD" in
+      *@@*)
+        find_crash_timeout_files | xargs -0 -r -n 1 -P "$FORKS" \
+          bash -c 'timeout --signal=SIGTERM "${2}s" bash -c "${1/@@/$3}"' \
+          _ "$COVERAGE_CMD" "$TIMEOUT" \
+          >/dev/null 2>&1 || true
+        ;;
+      *)
+        find_crash_timeout_files | xargs -0 -r -n 1 -P "$FORKS" \
+          bash -c 'timeout --signal=SIGTERM "${2}s" bash -c "$1" < "$3"' \
+          _ "$COVERAGE_CMD" "$TIMEOUT" \
+          >/dev/null 2>&1 || true
+        ;;
+    esac
   fi
 
   # ── check profraw files were generated ────────────────────────────────────
   local PROFRAW_COUNT
-  PROFRAW_COUNT=$(find "$PROFRAW_DIR" -name '*.profraw' 2>/dev/null | wc -l)
+  PROFRAW_COUNT=$(find "$PROFRAW_DIR" -name '*.profraw' -printf . 2>/dev/null | wc -c)
   if test "$PROFRAW_COUNT" -eq 0; then
     err "No .profraw files generated."
     err "Check that the binary is instrumented with -fprofile-instr-generate."
@@ -1453,6 +1541,7 @@ cmd_report() {
   }
 
   log "Generating JSON export..."
+  # llvm-cov quirk: --format=text emits JSON; --format=lcov emits LCOV.
   "$LLVM_COV" export "$COV_BINARY" \
     --format=text \
     "-instr-profile=$REPORT_DIR/coverage.profdata" \
