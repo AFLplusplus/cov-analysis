@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Verify find_tool() selects the LLVM tool matching the chosen clang version.
 #
 # Regression: with CC=clang-22 selected, find_tool must return llvm-profdata-22

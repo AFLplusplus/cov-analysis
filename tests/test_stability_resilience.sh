@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Regression test: a single failed pass must NOT abort the whole stability run.
 #
 # Reproduces the reported bug "llvm-profdata merge failed for pass 4" aborting

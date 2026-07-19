@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Tests for the `search` subcommand: pure helpers (always) + an integration
 # test gated on clang/llvm-cov (skipped cleanly when the toolchain is absent).
 set -uo pipefail

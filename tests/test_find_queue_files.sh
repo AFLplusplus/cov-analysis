@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Verify find_queue_files emits the right set of paths per layout.
 set -uo pipefail
 

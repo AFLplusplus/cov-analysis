@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Verify reachability-aware annotation of llvm-cov's own reports: cross coverage
 # with the fuzz-reachability tool's output and, in place,
 #   - tint each function's lines in the HTML file view (dark grey = unreachable,

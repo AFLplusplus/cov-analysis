@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tests/test_reachability_ziggy_e2e.sh — cargo-ziggy keystone round-trip:
 # fuzz-reachability analyses a real cargo-ziggy fuzz target (rooted at `main` via
 # the `ziggy::fuzz!` closure, the ziggy entry) with `--lang ziggy --mangling v0`,

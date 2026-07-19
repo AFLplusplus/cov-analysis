@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Verify detect_fuzzer_layout() correctly classifies each supported layout.
 set -uo pipefail
 

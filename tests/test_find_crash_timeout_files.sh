@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Verify find_crash_timeout_files emits the right set per layout.
 set -uo pipefail
 

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tests/run.sh — run every tests/test_*.sh, report pass/fail.
 set -uo pipefail
 

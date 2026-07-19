@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Behavior test: `cov-analysis diff` with no arguments and no default reports in
 # the current directory prints help (exit 0) instead of erroring. When a default
 # report IS present, the original "report does not exist" error is preserved.

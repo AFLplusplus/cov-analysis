@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tests/test_reachability_cpp_e2e.sh — C++ keystone round-trip: fuzz-reachability's
 # static analysis of a deliberately adversarial C++ harness (every indirect-call
 # flavor, plus red-herring and genuinely-dead functions) cross-referenced against

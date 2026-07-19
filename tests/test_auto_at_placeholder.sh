@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Feature test: when the coverage binary is built from the cov-analysis driver
 # (it reads inputs from file arguments, not stdin) and the user forgot the @@
 # placeholder, cov-analysis must behave as if "<cmd> @@" had been given.

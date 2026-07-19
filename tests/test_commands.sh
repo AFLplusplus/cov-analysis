@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # End-to-end integration test exercising every cov-analysis command against the
 # tests/test.c LLVMFuzzerTestOneInput target (a magic-value NULL-deref crash on
 # inputs of the form "FA$$$"). Gated on clang/llvm-cov/llvm-profdata/make; skips

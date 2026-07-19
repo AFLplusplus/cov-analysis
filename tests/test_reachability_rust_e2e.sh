@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tests/test_reachability_rust_e2e.sh — keystone round-trip: fuzz-reachability's
 # static analysis of a real Rust staticlib, cross-referenced against a real
 # `-Cinstrument-coverage` build replayed through llvm-cov, via cov-analysis's
