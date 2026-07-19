@@ -1,3 +1,6 @@
+# v1.2
+- ...
+
 # v1.1
 - report: publish complete reports transactionally, refuse unmarked non-empty destinations, and support explicit migration of legacy reports
 - replay: run all `-e` commands consistently through Bash, add `--binary` for complex commands, and enforce process-group timeouts

@@ -2,7 +2,7 @@
 #
 #  File: cov-analysis
 #
-#  Version: 1.1
+#  Version: 1.2-dev
 #
 #  Purpose: Generate LLVM source-based code coverage reports from AFL++ corpus.
 #           Replays queue/crash/timeout files through a coverage-instrumented
@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-VERSION="1.1"
+VERSION="1.2-dev"
 REPORT_MARKER_NAME=".cov-analysis-report"
 
 # ── helpers ───────────────────────────────────────────────────────────────────
