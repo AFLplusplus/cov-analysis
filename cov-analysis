@@ -180,6 +180,153 @@ write_profile_manifest() {
   find "$dir" -type f -name '*.profraw' -print | sort > "$manifest"
 }
 
+_stab_macro_sites() {
+  local profdata="$1"
+  "$LLVM_COV" export "$COV_BINARY" --format=text "-instr-profile=$profdata" 2>/dev/null \
+    | python3 -c '
+import json
+import sys
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(0)
+
+sites = {}
+for obj in data.get("data", []) or []:
+    for entry in obj.get("files", []) or []:
+        for exp in entry.get("expansions", []) or []:
+            names = exp.get("filenames") or []
+            src = exp.get("source_region") or []
+            if len(src) < 7:
+                continue
+            efid = src[6]
+            if not isinstance(efid, int) or efid < 0 or efid >= len(names):
+                continue
+            target = names[efid]
+            lines = set()
+            for region in exp.get("target_regions") or []:
+                if len(region) >= 6 and region[5] == efid:
+                    lines.add(region[0])
+            for line in lines:
+                key = (target, line)
+                sites[key] = sites.get(key, 0) + 1
+
+for (path, line), count in sorted(sites.items()):
+    print("%s:%d\t%d" % (path, line, count))
+'
+}
+
+write_gap_inventory() {
+  local perfunc="$1" out="$2" verdicts="${3-}" tmpd rc=0
+  local have_v=0
+  test -n "$verdicts" && test -s "$verdicts" && have_v=1
+  tmpd="$(mktemp -d "$(tmp_base_dir)/cov-analysis-gaps.XXXXXX")" || return 1
+
+  if test -s "$perfunc"; then
+    awk -v verdicts="$verdicts" -v have_v="$have_v" \
+        -v ffile="$tmpd/files.tsv" -v gfile="$tmpd/funcs.tsv" '
+      BEGIN {
+        if (have_v == 1) {
+          while ((getline line < verdicts) > 0) {
+            n = split(line, v, "\t")
+            if (n >= 3) vstate[v[2] "\t" v[3]] = v[1]
+          }
+          close(verdicts)
+        }
+      }
+      substr($0, 1, 6) == "File \047" {
+        f = substr($0, 7)
+        sub(/\047:[ \t]*$/, "", f)
+        cur = f
+        racc = 0
+        next
+      }
+      {
+        if (cur == "" || NF < 10) next
+        if ($2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+$/) next
+        if ($5 !~ /^[0-9]+$/ || $6 !~ /^[0-9]+$/) next
+        regions = $2 + 0; rmiss = $3 + 0; rcover = $4
+        lines = $5 + 0; lmiss = $6 + 0
+        if ($1 == "TOTAL") {
+          key = (have_v == 1) ? racc : rmiss
+          print key "\t" rmiss "\t" racc "\t" lmiss "\t" regions "\t" rcover "\t" cur > ffile
+          next
+        }
+        st = "none"
+        if (have_v == 1 && ((cur "\t" $1) in vstate)) st = vstate[cur "\t" $1]
+        if (st != "unreachable") racc += rmiss
+        if (regions > 0 && rmiss == regions) {
+          print rmiss "\t" lmiss "\t" st "\t" $1 "\t" cur > gfile
+        }
+      }
+    ' "$perfunc" || rc=1
+  fi
+  : > "$tmpd/files.tsv.sorted"
+  : > "$tmpd/funcs.tsv.sorted"
+  test -s "$tmpd/files.tsv" && sort -t "$(printf '\t')" -k1,1nr -k7,7 \
+    "$tmpd/files.tsv" > "$tmpd/files.tsv.sorted"
+  test -s "$tmpd/funcs.tsv" && sort -t "$(printf '\t')" -k1,1nr -k4,4 \
+    "$tmpd/funcs.tsv" > "$tmpd/funcs.tsv.sorted"
+
+  {
+    printf 'Coverage gaps\n'
+    printf '=============\n\n'
+    printf 'Ranked by ABSOLUTE uncovered regions, not by percentage: a large file at\n'
+    printf '4%% holds far more uncovered code than a small file at 0%%. Percentages are\n'
+    printf 'shown for context only. Numbers come from llvm-cov and match summary.txt.\n\n'
+
+    printf '== Files by uncovered regions ==\n\n'
+    if test "$have_v" -eq 1; then
+      printf '%10s %10s %10s %10s %8s\n' Uncovered Reachable Uncovered Total Region
+      printf '%10s %10s %10s %10s %8s  %s\n' regions uncovered lines regions cover File
+    else
+      printf '%10s %10s %10s %8s\n' Uncovered Uncovered Total Region
+      printf '%10s %10s %10s %8s  %s\n' regions lines regions cover File
+    fi
+    if test -s "$tmpd/files.tsv.sorted"; then
+      awk -F '\t' -v v="$have_v" '
+        v == 1 { printf "%10s %10s %10s %10s %8s  %s\n", $2, $3, $4, $5, $6, $7; next }
+        { printf "%10s %10s %10s %8s  %s\n", $2, $4, $5, $6, $7 }
+      ' "$tmpd/files.tsv.sorted"
+    else
+      printf '  (no per-function coverage data)\n'
+    fi
+
+    if test "$have_v" -eq 1; then
+      printf '\n== Functions with no coverage: reachable or unclassified (actionable) ==\n\n'
+      _gap_function_block "$tmpd/funcs.tsv.sorted" actionable
+      printf '\n== Functions with no coverage: statically unreachable (expected dead) ==\n\n'
+      _gap_function_block "$tmpd/funcs.tsv.sorted" dead
+    else
+      printf '\n== Functions with no coverage ==\n\n'
+      _gap_function_block "$tmpd/funcs.tsv.sorted" all
+    fi
+  } > "$out"
+
+  rm -rf -- "$tmpd"
+  test "$rc" -eq 0 || return 1
+  test -s "$out"
+}
+
+_gap_function_block() {
+  local sorted="$1" which="$2" body=""
+  printf '%10s %10s\n' Uncovered Uncovered
+  printf '%10s %10s  %-38s %s\n' regions lines Function File
+  if test -s "$sorted"; then
+    body="$(awk -F '\t' -v w="$which" '
+      w == "actionable" && $3 == "unreachable" { next }
+      w == "dead" && $3 != "unreachable" { next }
+      { printf "%10s %10s  %-38s %s\n", $1, $2, $4, $5 }
+    ' "$sorted")"
+  fi
+  if test -n "$body"; then
+    printf '%s\n' "$body"
+  else
+    printf '  (none)\n'
+  fi
+}
+
 merge_profiles() {
   local tool="$1" dir="$2" output="$3" failure_mode="${4-}" manifest="${5-}"
   if test -z "$manifest"; then
@@ -253,6 +400,7 @@ validate_staged_report() {
   test -s "$dir/coverage.profdata" || return 1
   test -s "$dir/coverage.json" || return 1
   test -s "$dir/summary.txt" || return 1
+  test -s "$dir/gaps.txt" || return 1
   test -s "$dir/html/index.html" || return 1
   test -d "$dir/text" || return 1
   grep -q '"data"' "$dir/coverage.json" || return 1
@@ -921,6 +1069,11 @@ Usage: cov-analysis stability [options]
   skipped and the run continues with the remaining passes, as long as at
   least 2 passes succeed.
 
+  Macro definition lines are listed separately: llvm-cov attributes every
+  expansion to the line of the #define, so a macro used from varying call sites
+  is reported as one unstable line in a header, which is not a location to fix.
+  The split needs python3 and the JSON export; without python3 it is skipped.
+
   Every analyzed pass measures the same inputs. An input killed at the -T
   deadline never writes its profile and so contributes nothing to that pass;
   such inputs are excluded from ALL passes and reported, because comparing
@@ -939,6 +1092,9 @@ Optional:
   -n <num>           Number of runs per corpus pass (default: 4)
   -s <prefix>        Only consider source lines whose file path contains
                      this prefix (e.g. -s src/)
+  --exclude-regex <re>
+                     Drop source files whose path matches this regex, applied
+                     on top of -s (e.g. --exclude-regex '\.h$')
   -t <num>           Parallel replay workers (default: 1)
   -T <secs>          Per-input timeout in seconds (default: 5)
                      Timed targets receive TERM, then KILL after 1 second.
@@ -953,6 +1109,7 @@ Optional:
 Examples:
   cov-analysis stability -d out -e "./cov @@"
   cov-analysis stability -d out -e "./cov @@" -n 8 -s src/
+  cov-analysis stability -d out -e "./cov @@" --exclude-regex '\.h$'
   cov-analysis stability -d ./corpus -e "./cov @@" -t 4
 EOF
 }
@@ -1108,6 +1265,7 @@ cmd_stability() {
   local FUZZER_LAYOUT="${FUZZER_LAYOUT:-}"
   local GAWK=""
   local STAB_KEPT=0    # inputs that produced coverage in every analyzed pass
+  local EXCLUDE_FILTER=""
 
   if test $# -eq 0; then usage_stability; exit 1; fi
 
@@ -1117,6 +1275,8 @@ cmd_stability() {
       -e)        need_arg "-e" "${2-}"; COVERAGE_CMD="$2";             shift 2 ;;
       -n)        need_arg "-n" "${2-}"; RUNS="$2"; USER_RUNS="1";      shift 2 ;;
       -s)        need_arg "-s" "${2-}"; SOURCE_FILTER="$2";            shift 2 ;;
+      --exclude-regex)
+                 need_arg "--exclude-regex" "${2-}"; EXCLUDE_FILTER="$2"; shift 2 ;;
       -t)        need_arg "-t" "${2-}"; FORKS="$2";                    shift 2 ;;
       -T)        need_arg "-T" "${2-}"; TIMEOUT="$2";                  shift 2 ;;
       --binary)  need_arg "--binary" "${2-}"; BINARY_OVERRIDE="$2";   shift 2 ;;
@@ -1234,6 +1394,7 @@ cmd_stability() {
   log "Coverage binary : $COV_BINARY"
   log "Runs            : $RUNS"
   test -n "$SOURCE_FILTER" && log "Source filter   : $SOURCE_FILTER"
+  test -n "$EXCLUDE_FILTER" && log "Exclude filter  : $EXCLUDE_FILTER"
 
   # Number every input once and reuse that numbering for all passes: the index
   # prefixes each input's .profraw files, so a pass's profile set identifies
@@ -1329,10 +1490,11 @@ cmd_stability() {
     }
 
     logv "Pass $idx: parsing hit counts..."
-    awk -v filter="$SOURCE_FILTER" '
+    awk -v filter="$SOURCE_FILTER" -v exclude="$EXCLUDE_FILTER" '
       /^SF:/ { file = substr($0, 4) }
       /^DA:/ {
         if (filter != "" && index(file, filter) == 0) next
+        if (exclude != "" && file ~ exclude) next
         split(substr($0, 4), a, ",")
         print file ":" a[1] "\t" a[2]
       }
@@ -1461,10 +1623,28 @@ cmd_stability() {
     : "${stable_count:=0}" "${total_lines:=0}"
   fi
 
+  # ── separate macro definition lines from real locations ────────────────────
+  # llvm-cov attributes every expansion to the line of the #define, so a macro
+  # used from varying call sites is reported as one unstable line in a header —
+  # a non-location. Needs the JSON export; without python3 the split is skipped.
+  local macro_lines="" plain_lines="$unstable_lines"
+  if test -n "$unstable_lines" && command -v python3 >/dev/null 2>&1; then
+    if _stab_macro_sites "$STAB_DIR/merged_run_${stab_passes[0]}.profdata" \
+         > "$STAB_DIR/macro.map" 2>/dev/null && test -s "$STAB_DIR/macro.map"; then
+      plain_lines="$(printf '%s\n' "$unstable_lines" | awk -F '\t' '
+        NR == FNR { m[$1] = $2; next }
+        !($0 in m)' "$STAB_DIR/macro.map" -)"
+      macro_lines="$(printf '%s\n' "$unstable_lines" | awk -F '\t' '
+        NR == FNR { m[$1] = $2; next }
+        ($0 in m) { printf "  %s  (%d expansion site%s)\n", $0, m[$0],
+                           (m[$0] == 1 ? "" : "s") }' "$STAB_DIR/macro.map" -)"
+    fi
+  fi
+
   # ── collapse consecutive unstable lines into ranges ────────────────────────
   local ranges=""
-  if test -n "$unstable_lines"; then
-    ranges="$(printf '%s\n' "$unstable_lines" | awk '
+  if test -n "$plain_lines"; then
+    ranges="$(printf '%s\n' "$plain_lines" | awk '
       BEGIN { prev_file = ""; prev_line = -999; range_start = -999 }
       {
         n = split($0, parts, ":")
@@ -1523,7 +1703,18 @@ cmd_stability() {
       printf "~~ Variable-count lines (%d lines):\n" "$unstable_count"
       echo "   Lines with varying hit counts:"
       echo ""
-      printf '%s\n' "$ranges"
+      if test -n "$ranges"; then
+        printf '%s\n' "$ranges"
+      else
+        echo "  (none outside macro definitions)"
+      fi
+      if test -n "$macro_lines"; then
+        echo ""
+        echo "   Macro definitions - llvm-cov attributes every expansion to the #define,"
+        echo "   so these vary with their call sites and are not locations to fix:"
+        echo ""
+        printf '%s\n' "$macro_lines"
+      fi
       echo ""
       echo "[!] Unstable coverage detected."
     else
@@ -2530,6 +2721,7 @@ PYEOF
 # Shares reach_py_lib's parse_reachability/reach_state with cmd_diff.
 annotate_reachability() {
   local COVJSON="$1" REACH="$2" HTML_DIR="$3" TEXT_DIR="$4" SUMMARY="$5" PERFUNC="${6:-}"
+  local VERDICTS="${7:-}"
   { reach_py_lib; cat << 'PYEOF'
 #
 # (c) 2026 Marc "vanHauser" Heuse
@@ -2545,6 +2737,7 @@ import sys
 
 cov_path, reach_path, html_dir, text_dir, summary_path = sys.argv[1:6]
 perfunc_path = sys.argv[6] if len(sys.argv) > 6 else ''
+verdict_path = sys.argv[7] if len(sys.argv) > 7 else ''
 
 
 def load_json(path):
@@ -2853,6 +3046,7 @@ def blank_metric():
 
 def parse_perfunc(path):
     cur = None
+    vout = open(verdict_path, 'w', encoding='utf-8') if verdict_path else None
     with open(path, 'r', encoding='utf-8', errors='replace') as f:
         for line in f:
             s = line.rstrip('\n')
@@ -2873,7 +3067,10 @@ def parse_perfunc(path):
                 br, br_m = int(toks[7]), int(toks[8])
             except (ValueError, IndexError):
                 continue
-            if perfunc_member(name, cur) == 'unreachable':
+            verdict = perfunc_member(name, cur)
+            if vout is not None:
+                vout.write('%s\t%s\t%s\n' % (verdict, cur, name))
+            if verdict == 'unreachable':
                 continue  # exclude statically-dead functions from every metric
             m = file_metrics[cur]
             m['fn'] += 1
@@ -2884,6 +3081,8 @@ def parse_perfunc(path):
             m['line_cov'] += ln - ln_m
             m['br'] += br
             m['br_cov'] += br - br_m
+    if vout is not None:
+        vout.close()
 
 
 have_numbers = bool(perfunc_path) and os.path.isfile(perfunc_path)
@@ -3015,7 +3214,7 @@ if have_numbers:
 print('reachable=%d not-reached=%d unreachable=%d anomaly=%d'
       % (t_reachable, t_unreached, t_unreachable, t_anomaly))
 PYEOF
-  } | python3 - "$COVJSON" "$REACH" "$HTML_DIR" "$TEXT_DIR" "$SUMMARY" "$PERFUNC"
+  } | python3 - "$COVJSON" "$REACH" "$HTML_DIR" "$TEXT_DIR" "$SUMMARY" "$PERFUNC" "$VERDICTS"
 }
 
 # ── command: report ───────────────────────────────────────────────────────────
@@ -3121,9 +3320,9 @@ cmd_report() {
   require_replay_commands "cov-analysis report" || exit 1
   require_coreutils_command mv "cov-analysis report" || exit 1
   require_coreutils_command realpath "cov-analysis report" || exit 1
+  require_command python3 "cov-analysis report" || exit 1
   AFL_DIR="$(resolve_input_dir "$AFL_DIR")" || exit 1
   if test -n "$REACHABILITY"; then
-    require_command python3 "report --reachability" || exit 1
     if ! validate_reachability "$REACHABILITY"; then
       err "Invalid reachability input: $REACHABILITY"
       exit 1
@@ -3390,35 +3589,51 @@ cmd_report() {
     exit 1
   }
 
-  # ── reachability annotation (optional) ─────────────────────────────────────
-  if test -n "$REACHABILITY"; then
-    log "Annotating reports with reachability..."
-    # Per-function metrics let the annotator recompute Function/Line/Region/
-    # Branch coverage excluding statically-unreachable functions.
-    local PERFUNC="$PROFRAW_DIR/perfunc.txt"
-    local SRC_RESPONSE="$PROFRAW_DIR/sources.rsp"
-    if ! write_source_response "$STAGE_DIR/coverage.json" "$SRC_RESPONSE"; then
-      err "Could not build the source response file for reachable-only metrics."
-      exit 1
-    fi
+  # ── per-function metrics ───────────────────────────────────────────────────
+  # They feed the gap inventory, and let the reachability annotator recompute
+  # Function/Line/Region/Branch coverage excluding unreachable functions.
+  local PERFUNC="$PROFRAW_DIR/perfunc.txt"
+  local SRC_RESPONSE="$PROFRAW_DIR/sources.rsp"
+  : > "$PERFUNC"
+  if write_source_response "$STAGE_DIR/coverage.json" "$SRC_RESPONSE" 2>/dev/null; then
     if ! "$LLVM_COV" report "$COV_BINARY" \
       "-instr-profile=$STAGE_DIR/coverage.profdata" \
       "-ignore-filename-regex=$IGNORE_REGEX" \
       -show-functions "@$SRC_RESPONSE" > "$PERFUNC"; then
-      err "llvm-cov per-function report failed; reachability metrics were not generated."
+      err "llvm-cov per-function report failed."
       exit 1
     fi
     if ! test -s "$PERFUNC"; then
-      err "llvm-cov per-function report was empty; reachability metrics were not generated."
+      err "llvm-cov per-function report was empty."
       exit 1
     fi
+  elif test -n "$REACHABILITY"; then
+    err "Could not build the source response file for reachable-only metrics."
+    exit 1
+  else
+    logv "Coverage export lists no source files; the gap inventory will be empty."
+  fi
+
+  # ── reachability annotation (optional) ─────────────────────────────────────
+  local VERDICTS=""
+  if test -n "$REACHABILITY"; then
+    log "Annotating reports with reachability..."
+    VERDICTS="$PROFRAW_DIR/verdicts.tsv"
     local REACH_TALLY=""
     if ! REACH_TALLY="$(annotate_reachability "$STAGE_DIR/coverage.json" "$REACHABILITY" \
-         "$STAGE_DIR/html" "$STAGE_DIR/text" "$STAGE_DIR/summary.txt" "$PERFUNC")"; then
+         "$STAGE_DIR/html" "$STAGE_DIR/text" "$STAGE_DIR/summary.txt" "$PERFUNC" \
+         "$VERDICTS")"; then
       err "Reachability annotation failed."
       exit 1
     fi
     log "Reachability: $REACH_TALLY"
+  fi
+
+  # ── gap inventory ──────────────────────────────────────────────────────────
+  log "Building gap inventory..."
+  if ! write_gap_inventory "$PERFUNC" "$STAGE_DIR/gaps.txt" "$VERDICTS"; then
+    err "Could not build the gap inventory."
+    exit 1
   fi
 
   if ! validate_staged_report "$STAGE_DIR" "$REACHABILITY"; then
@@ -3439,9 +3654,18 @@ cmd_report() {
       cat "$REPORT_DIR/summary.txt"
       echo ""
     fi
+    if test -s "$REPORT_DIR/gaps.txt"; then
+      echo "Top coverage gaps (uncovered regions, uncovered lines, total, cover, file):"
+      awk '/^== Files by uncovered regions ==/ { insec = 1; next }
+           insec && substr($0, 1, 3) == "== " { exit }
+           insec && $0 ~ /^ *[0-9]/ { n++; if (n <= 10) print "    " $0 }' \
+        "$REPORT_DIR/gaps.txt"
+      echo ""
+    fi
     echo "[+] HTML report  : file://$REPORT_DIR/html/index.html"
     echo "[+] Text report  : $REPORT_DIR/text/"
     echo "[+] Summary      : $REPORT_DIR/summary.txt"
+    echo "[+] Gap inventory: $REPORT_DIR/gaps.txt"
     echo "[+] JSON export  : $REPORT_DIR/coverage.json"
     echo "[+] Profile data : $REPORT_DIR/coverage.profdata"
   fi

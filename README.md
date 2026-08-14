@@ -51,7 +51,8 @@ The coverage reports can be augmented with harness reachability information from
   (`timeout`, `mktemp`, `realpath`, `mv`, `sort`, `tr`, and `wc`). Timed replays
   send `TERM`, escalate to `KILL` after one second, and clean up the spawned
   process group.
-- Python 3 for `diff` and `report --reachability`.
+- Python 3 for `report` (it derives the per-function source list), `diff`,
+  and the macro-definition split in `stability` (skipped if absent there).
 - GNU awk (`gawk`) for `stability`.
 - AFL++ (`afl-fuzz`), libafl, libfuzzer, Honggfuzz, ... - only needed to produce the corpus, not to run `cov-analysis`
 
@@ -162,9 +163,20 @@ Output:
   html/index.html     ← browse this for annotated source coverage
   text/               ← text format, suitable for automated analysis
   summary.txt         ← per-file line/branch/function percentages
+  gaps.txt            ← uncovered code ranked by ABSOLUTE uncovered regions
   coverage.json       ← machine-readable export
   coverage.profdata   ← merged profile (baseline for iterative improvement)
 ```
+
+`gaps.txt` answers "where is the most uncovered code" without post-processing.
+It ranks files by absolute uncovered regions — a 3,553-region file at 4% holds
+far more uncovered code than an 85-region file at 0%, which a percentage sort
+gets backwards — and then lists every function with no coverage at all, ranked
+the same way. Its numbers come from `llvm-cov report -show-functions` and match
+`summary.txt`. The top entries are printed at the end of a report run. With
+`--reachability` the function list is split into the actionable gap (reachable
+or unclassified) and expected dead code (statically unreachable), and files are
+ranked by their *reachable* uncovered regions.
 
 Report publication is transactional. All artifacts are generated and validated
 in a sibling staging directory on the same filesystem, including optional
@@ -345,6 +357,14 @@ The denominator is the union of source lines executed at least once across all
 successful passes. Lines that are zero or absent in every pass are excluded;
 a zero/absent-to-positive transition is included and classified unstable. If no
 line executes in any successful pass, stability is `n/a`.
+
+Macro definition lines are reported separately. llvm-cov attributes every macro
+expansion to the line of the `#define`, so a macro used from varying call sites
+(the field report names `SSH_LOG` at `priv.h:283`) shows up as a single unstable
+line in a header, which is not a location anyone can fix. Those lines are listed
+under their own heading with the number of expansion sites, leaving the main
+list actionable. Use `--exclude-regex` to drop such files from the analysis
+altogether.
 
 Every analyzed pass measures the same inputs. An input killed at the `-T`
 deadline never writes its profile, so it contributes nothing to that pass —
@@ -553,6 +573,9 @@ Optional:
   -n <num>           Number of runs per corpus pass (default: 4)
   -s <prefix>        Only consider source lines whose file path contains
                      this prefix (e.g. -s src/)
+  --exclude-regex <re>
+                     Drop source files whose path matches this regex, applied
+                     on top of -s (e.g. --exclude-regex '\.h$')
   -t <num>           Parallel replay workers (default: 1)
   -T <secs>          Per-input timeout in seconds (default: 5)
   --binary <path>    Instrumented binary for ambiguous -e shell commands
@@ -570,6 +593,7 @@ Examples:
 ```bash
 cov-analysis stability -d out/ -e "./cov @@"
 cov-analysis stability -d out/ -e "./cov @@" -n 8 -s src/
+cov-analysis stability -d out/ -e "./cov @@" --exclude-regex '\.h$'
 cov-analysis stability -d ./corpus -e "./cov @@" -t 4
 cov-analysis stability -d out/ -e "./cov @@" -T 2
 ```

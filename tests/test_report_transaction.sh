@@ -113,9 +113,11 @@ assert_same "$DEST" "$TMP/snapshot" "malformed reachability changed the previous
 
 FAILPY="$TMP/fail-python"
 mkdir "$FAILPY"
+# Fail only the annotation call: it is the one python3 invocation with many
+# arguments (validate_reachability uses 2, write_source_response 3).
 cat > "$FAILPY/python3" <<'EOF'
 #!/bin/bash
-test $# -eq 7 && exit 99
+test $# -ge 7 && exit 99
 exec /usr/bin/python3 "$@"
 EOF
 chmod +x "$FAILPY/python3"
