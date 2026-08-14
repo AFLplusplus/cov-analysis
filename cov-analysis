@@ -128,15 +128,64 @@ run_input_command_unbounded() {
   esac
 }
 
+number_inputs() {
+  local n=0 p
+  while IFS= read -r -d '' p; do
+    n=$((n + 1))
+    printf '%d\t%s\0' "$n" "$p"
+  done
+}
+
+replay_one_input() {
+  local cmd="$1" seconds="$2" dir="$3" record="$4" idx path status
+  idx="${record%%$'\t'*}"
+  path="${record#*$'\t'}"
+  export LLVM_PROFILE_FILE="$dir/${idx}-%p.profraw"
+  if test "$seconds" -gt 0; then
+    run_input_command "$seconds" "$cmd" "$path" >/dev/null 2>&1
+  else
+    run_input_command_unbounded "$cmd" "$path" >/dev/null 2>&1
+  fi
+  status=$?
+  printf '%d\n' "$status"
+}
+
+resolve_input_dir() {
+  local dir="$1" resolved
+  if ! resolved="$(realpath -e -- "$dir" 2>/dev/null)"; then
+    err "Could not resolve input directory: $dir"
+    return 1
+  fi
+  printf '%s\n' "$resolved"
+}
+
+replay_tally() {
+  local driver="$1"
+  awk -v driver="$driver" '
+    {
+      st = $1 + 0
+      n = (NF > 1 ? $2 + 0 : 1)
+      total += n
+      if (st == 0) ok += n
+      else if (st == 124 || st == 137) killed += n
+      else if (st == 2 && driver == 1) unreadable += n
+      else failed += n
+    }
+    END { printf "%d %d %d %d %d\n", total+0, ok+0, failed+0, killed+0, unreadable+0 }
+  '
+}
+
 write_profile_manifest() {
   local dir="$1" manifest="$2"
   find "$dir" -type f -name '*.profraw' -print | sort > "$manifest"
 }
 
 merge_profiles() {
-  local tool="$1" dir="$2" output="$3" failure_mode="${4-}"
-  local manifest="$dir/profiles.manifest"
-  write_profile_manifest "$dir" "$manifest"
+  local tool="$1" dir="$2" output="$3" failure_mode="${4-}" manifest="${5-}"
+  if test -z "$manifest"; then
+    manifest="$dir/profiles.manifest"
+    write_profile_manifest "$dir" "$manifest"
+  fi
   test -s "$manifest" || return 1
   if test -n "$failure_mode"; then
     "$tool" merge -sparse "--failure-mode=$failure_mode" "--input-files=$manifest" -o "$output"
@@ -589,6 +638,12 @@ int main(int argc, char **argv) {
     // needed for auto-detection in compiled binaries:
     if (argc == 2 && strcmp(argv[1], "--printsignature") == 0) {
         printf("###SIGNATURE_LLVMFUZZERTESTONEINPUT_COVERAGE###\n");
+        return 0;
+    }
+
+    for (int i = 1; i < argc; i++) {
+        char *resolved = realpath(argv[i], NULL);
+        if (resolved) argv[i] = resolved;
     }
 
     if (LLVMFuzzerInitialize) {
@@ -596,32 +651,54 @@ int main(int argc, char **argv) {
         LLVMFuzzerInitialize(&argc, &argv);
     }
 
+    int unusable = 0;
+    int empty = 0;
+
     for (int i = 1; i < argc; i++) {
         FILE *f = fopen(argv[i], "rb");
-        if (f) {
-            fseek(f, 0, SEEK_END);
-            long len = ftell(f);
-            if (len > 0) {
-                fseek(f, 0, SEEK_SET);
-                unsigned char *buf = (unsigned char *)malloc((size_t)len);
-                if (buf) {
-                    size_t n_read = fread(buf, 1, (size_t)len, f);
-                    if (n_read > 0) {
-                        fprintf(stderr, "Running: %s (%d/%d) %zu bytes\n",
-                                argv[i], i, argc - 1, n_read);
-                        LLVMFuzzerTestOneInput((const unsigned char*)buf, n_read);
-                    } else {
-                        fprintf(stderr, "Error: Read failed for %s\n", argv[i]);
-                    }
-                    free(buf);
-                }
-            }
-            fclose(f);
+        if (!f) {
+            fprintf(stderr, "Error: cannot open %s\n", argv[i]);
+            unusable++;
+            continue;
         }
+        long len = -1;
+        if (fseek(f, 0, SEEK_END) == 0) len = ftell(f);
+        if (len < 0) {
+            fprintf(stderr, "Error: cannot size %s\n", argv[i]);
+            unusable++;
+            fclose(f);
+            continue;
+        }
+        if (len == 0) {
+            fprintf(stderr, "Warning: empty input: %s\n", argv[i]);
+            empty++;
+            fclose(f);
+            continue;
+        }
+        fseek(f, 0, SEEK_SET);
+        unsigned char *buf = (unsigned char *)malloc((size_t)len);
+        if (!buf) {
+            fprintf(stderr, "Error: out of memory for %s\n", argv[i]);
+            unusable++;
+            fclose(f);
+            continue;
+        }
+        size_t n_read = fread(buf, 1, (size_t)len, f);
+        if (n_read > 0) {
+            fprintf(stderr, "Running: %s (%d/%d) %zu bytes\n",
+                    argv[i], i, argc - 1, n_read);
+            LLVMFuzzerTestOneInput((const unsigned char*)buf, n_read);
+        } else {
+            fprintf(stderr, "Error: read failed for %s\n", argv[i]);
+            unusable++;
+        }
+        free(buf);
+        fclose(f);
     }
 
-    fprintf(stderr, "Done.\n");
-    return 0;
+    fprintf(stderr, "Done. %d input(s), %d unusable, %d empty.\n",
+            argc - 1, unusable, empty);
+    return unusable ? 2 : 0;
 }
 DRIVER_EOF
 }
@@ -673,6 +750,16 @@ Optional:
                      Required when -e contains a quoted binary path, wrapper,
                      or other shell syntax that cannot be inferred safely.
   --layout <kind>    Force layout: 'afl' or 'flat' (default: auto-detect)
+  --max-replay-failures <pct>
+                     Fail the run when more than <pct> percent of the queue
+                     inputs did not replay cleanly (default: 99, so a corpus in
+                     which every input failed is fatal — that means the target
+                     never processed its inputs and the coverage is wrong).
+                     Crash and timeout inputs are exempt: they are expected to
+                     die. Pass 100 for targets that legitimately exit non-zero
+                     for rejected inputs. Inputs are always handed to the target
+                     as absolute paths, so a target that changes its working
+                     directory still finds them.
   --ignore-regex <r> Filename regex to exclude from llvm-cov reports
                      (default: /usr/include/)
   --reachability <p> Cross-reference fuzz-reachability output and annotate the
@@ -773,6 +860,12 @@ Usage: cov-analysis driver [-o output.c]
   is best effort: __llvm_profile_write_file() is not async-signal-safe and may
   fail after severe memory corruption. The original signal is re-raised.
 
+  Every input path is resolved to an absolute path before the harness runs, so
+  a harness that changes its working directory still finds its inputs. Inputs
+  that cannot be read are reported on stderr and make the driver exit 2; empty
+  inputs are reported but are not an error. cov-analysis report treats that
+  exit 2 as a failed measurement rather than a target failure.
+
 Options:
   -o <file>     Write driver source to FILE instead of stdout
   -h, --help    Show this help
@@ -827,6 +920,13 @@ Usage: cov-analysis stability [options]
   merged (e.g. a crashing input that left a truncated .profraw behind) is
   skipped and the run continues with the remaining passes, as long as at
   least 2 passes succeed.
+
+  Every analyzed pass measures the same inputs. An input killed at the -T
+  deadline never writes its profile and so contributes nothing to that pass;
+  such inputs are excluded from ALL passes and reported, because comparing
+  passes that measured different inputs reports instability that does not
+  exist. The verdict therefore does not depend on -t. If no input survives
+  every pass, the run fails instead of reporting a meaningless number.
 
 Required:
   -d <dir>    Fuzzing output directory (AFL++, libFuzzer, libafl, or honggfuzz)
@@ -1007,6 +1107,7 @@ cmd_stability() {
   local USER_RUNS=""   # set if -n was explicitly provided
   local FUZZER_LAYOUT="${FUZZER_LAYOUT:-}"
   local GAWK=""
+  local STAB_KEPT=0    # inputs that produced coverage in every analyzed pass
 
   if test $# -eq 0; then usage_stability; exit 1; fi
 
@@ -1068,6 +1169,7 @@ cmd_stability() {
   fi
 
   require_replay_commands "cov-analysis stability" || exit 1
+  AFL_DIR="$(resolve_input_dir "$AFL_DIR")" || exit 1
 
   COV_BINARY="$(resolve_coverage_binary "$COVERAGE_CMD" "$BINARY_OVERRIDE")" || exit 1
   logv "Coverage binary : $COV_BINARY"
@@ -1133,38 +1235,86 @@ cmd_stability() {
   log "Runs            : $RUNS"
   test -n "$SOURCE_FILTER" && log "Source filter   : $SOURCE_FILTER"
 
-  # ── per-run coverage collection ────────────────────────────────────────────
-  # Collect one pass: replay all corpus, merge profraw, export LCOV, parse hits.
-  # Accepts run index as $1; reads globals COVERAGE_CMD, FORKS, STAB_DIR,
-  # COV_BINARY, SOURCE_FILTER, LLVM_PROFDATA, LLVM_COV, RUNS.
-  _stab_collect_pass() {
+  # Number every input once and reuse that numbering for all passes: the index
+  # prefixes each input's .profraw files, so a pass's profile set identifies
+  # exactly which inputs contributed to it (and PID reuse can no longer let one
+  # input overwrite another's counts).
+  find_queue_files | number_inputs > "$STAB_DIR/inputs.manifest"
+
+  # Replay one pass and record which input indices produced a profile.
+  # Returns 1 for a pass that produced nothing at all, so the caller can skip it.
+  _stab_replay_pass() {
     local idx="$1"
     local run_dir="$STAB_DIR/run_${idx}"
+    local stats p_total=0 p_ok=0 p_failed=0 p_killed=0 p_unreadable=0
     mkdir -p "$run_dir"
 
     log "Collecting pass $idx/$RUNS..."
-    export LLVM_PROFILE_FILE="$run_dir/cov-%p.profraw"
-    export -f run_with_timeout command_for_input run_input_command
-    find_queue_files | xargs -0 -r -n 1 -P "$FORKS" \
-      bash -c 'run_input_command "$2" "$1" "$3"' _ "$COVERAGE_CMD" "$TIMEOUT" \
-      >/dev/null 2>&1 || true
+    export -f run_with_timeout command_for_input run_input_command \
+      run_input_command_unbounded replay_one_input
+    stats="$(xargs -0 -r -n 1 -P "$FORKS" \
+      bash -c 'replay_one_input "$1" "$2" "$3" "$4"' \
+      _ "$COVERAGE_CMD" "$TIMEOUT" "$run_dir" \
+      < "$STAB_DIR/inputs.manifest" 2>/dev/null | replay_tally 0 || true)"
+    read -r p_total p_ok p_failed p_killed p_unreadable <<< "$stats" || true
+    logv "Pass $idx: $p_ok ok, $p_failed failed, $p_killed timed out (of $p_total)"
 
-    # A single failed pass must never abort the whole run: stability is a
-    # multi-sample measurement, so we skip a bad pass (return 1) and let the
-    # caller carry on with the rest. The most common cause is a crashing or
-    # timed-out input that left a truncated .profraw behind.
-    local profraw_count
-    profraw_count=$(find "$run_dir" -name '*.profraw' -printf . 2>/dev/null | wc -c)
-    if test "$profraw_count" -eq 0; then
+    find "$run_dir" -maxdepth 1 -type f -name '*.profraw' -print \
+      | "$GAWK" -F/ '{ n = $NF; sub(/-.*/, "", n); if (n ~ /^[0-9]+$/) print n }' \
+      | sort -u > "$STAB_DIR/run_${idx}.present"
+
+    if ! test -s "$STAB_DIR/run_${idx}.present"; then
       err "No .profraw files generated in pass $idx; skipping it."
       return 1
     fi
-    logv "Pass $idx: merging $profraw_count profraw file(s)..."
+    return 0
+  }
+
+  # Restrict analysis to the inputs that produced coverage in EVERY analyzed
+  # pass: an input killed at the deadline contributes nothing to that pass, and
+  # comparing passes that measured different inputs reports instability that
+  # does not exist.
+  _stab_refresh_common() {
+    local indices=("$@") n="${#indices[@]}" i kept
+    local present=()
+    for i in "${indices[@]}"; do present+=("$STAB_DIR/run_${i}.present"); done
+    "$GAWK" -v need="$n" '{ seen[$0]++ }
+      END { for (k in seen) if (seen[k] == need) print k }' \
+      "${present[@]}" | sort > "$STAB_DIR/common.idx"
+    kept=$(grep -c . "$STAB_DIR/common.idx" || true)
+    STAB_KEPT="$kept"
+    if test "$kept" -eq 0; then
+      err "No input produced coverage in all $n analyzed passes."
+      err "Raise the deadline with -T, lower the worker count with -t, or drop the inputs that time out."
+      exit 1
+    fi
+    if test "$kept" -lt "$CORPUS_SIZE"; then
+      log "Excluded $((CORPUS_SIZE - kept)) of $CORPUS_SIZE inputs that did not produce coverage in every pass"
+    fi
+  }
+
+  # Merge, export and parse one pass, counting only the common input set.
+  # Returns 1 for an unusable pass so the caller can skip it.
+  _stab_prepare_pass() {
+    local idx="$1"
+    local run_dir="$STAB_DIR/run_${idx}"
+    local manifest="$run_dir/merge.manifest"
+
+    find "$run_dir" -maxdepth 1 -type f -name '*.profraw' -print \
+      | "$GAWK" -v keep="$STAB_DIR/common.idx" -F/ '
+          BEGIN { while ((getline line < keep) > 0) want[line] = 1 }
+          { n = $NF; sub(/-.*/, "", n); if (n in want) print }' \
+      | sort > "$manifest"
+    if ! test -s "$manifest"; then
+      err "Pass $idx holds no profile for the common input set; skipping it."
+      return 1
+    fi
+    logv "Pass $idx: merging $(grep -c . "$manifest") profraw file(s)..."
 
     # --failure-mode=all: tolerate individual corrupt/truncated .profraw files
     # (drop them, keep the valid ones); only fail if every profile is invalid.
     merge_profiles "$LLVM_PROFDATA" "$run_dir" \
-      "$STAB_DIR/merged_run_${idx}.profdata" all 2>/dev/null || {
+      "$STAB_DIR/merged_run_${idx}.profdata" all "$manifest" 2>/dev/null || {
       err "llvm-profdata merge failed for pass $idx; skipping it."
       return 1
     }
@@ -1190,19 +1340,34 @@ cmd_stability() {
     return 0
   }
 
-  # stab_passes holds the run indices that produced usable per-line hit counts.
-  # Failed passes are skipped (see _stab_collect_pass) instead of aborting.
+  # stab_replayed holds the passes that produced any profile at all;
+  # stab_passes those that also yielded usable per-line hit counts. Failed
+  # passes are skipped instead of aborting the run.
+  local stab_replayed=()
   local stab_passes=()
   local run_idx
   for run_idx in $(seq 1 "$RUNS"); do
-    if _stab_collect_pass "$run_idx"; then
-      stab_passes+=("$run_idx")
+    if _stab_replay_pass "$run_idx"; then
+      stab_replayed+=("$run_idx")
     fi
   done
 
   log "Collected all data, analyzing ..."
 
   # Comparing hit counts across runs needs at least two successful passes.
+  if test "${#stab_replayed[@]}" -lt 2; then
+    err "Only ${#stab_replayed[@]} of $RUNS pass(es) produced coverage data — need at least 2 to assess stability."
+    err "Check that the binary is instrumented with -fprofile-instr-generate (see 'cov-analysis build')."
+    exit 1
+  fi
+
+  _stab_refresh_common "${stab_replayed[@]}"
+  for run_idx in "${stab_replayed[@]}"; do
+    if _stab_prepare_pass "$run_idx"; then
+      stab_passes+=("$run_idx")
+    fi
+  done
+
   if test "${#stab_passes[@]}" -lt 2; then
     err "Only ${#stab_passes[@]} of $RUNS pass(es) produced coverage data — need at least 2 to assess stability."
     err "Check that the binary is instrumented with -fprofile-instr-generate (see 'cov-analysis build')."
@@ -1268,11 +1433,25 @@ cmd_stability() {
     local extra_end=$((RUNS * 2))
     log "Instability detected, extending from $RUNS to $extra_end runs..."
     for run_idx in $(seq $((RUNS + 1)) "$extra_end"); do
-      if _stab_collect_pass "$run_idx"; then
-        stab_passes+=("$run_idx")
+      if _stab_replay_pass "$run_idx"; then
+        stab_replayed+=("$run_idx")
       fi
     done
     RUNS="$extra_end"
+
+    # The added passes can shrink the common input set, so every pass is
+    # re-merged against the refreshed set before the second analysis.
+    _stab_refresh_common "${stab_replayed[@]}"
+    stab_passes=()
+    for run_idx in "${stab_replayed[@]}"; do
+      if _stab_prepare_pass "$run_idx"; then
+        stab_passes+=("$run_idx")
+      fi
+    done
+    if test "${#stab_passes[@]}" -lt 2; then
+      err "Only ${#stab_passes[@]} of $RUNS pass(es) produced coverage data — need at least 2 to assess stability."
+      exit 1
+    fi
 
     log "Re-analyzing stability across ${#stab_passes[@]} runs..."
     analysis_out="$(_stab_analyze "${stab_passes[@]}")"
@@ -1326,6 +1505,10 @@ cmd_stability() {
     echo "Stability Report"
     echo "--------------------------------------------------------"
     printf "Corpus size : %s inputs\n" "$CORPUS_SIZE"
+    if test "$STAB_KEPT" -lt "$CORPUS_SIZE"; then
+      printf "Inputs used : %d of %d (%d excluded: no coverage in every pass)\n" \
+        "$STAB_KEPT" "$CORPUS_SIZE" "$((CORPUS_SIZE - STAB_KEPT))"
+    fi
     if test "${#stab_passes[@]}" -eq "$RUNS"; then
       printf "Runs        : %s\n" "$RUNS"
     else
@@ -1357,15 +1540,16 @@ cmd_stability() {
 # Reads globals: COVERAGE_CMD, FORKS, TIMEOUT, INCLUDE_CRASHES.
 _search_replay_union() {
   local outdir="$1"
-  export LLVM_PROFILE_FILE="$outdir/cov-%p.profraw"
-  export -f run_with_timeout command_for_input run_input_command
-  find_queue_files | xargs -0 -r -n 1 -P "$FORKS" \
-    bash -c 'run_input_command "$2" "$1" "$3"' _ "$COVERAGE_CMD" "$TIMEOUT" \
+  export -f run_with_timeout command_for_input run_input_command \
+    run_input_command_unbounded replay_one_input
+  find_queue_files | number_inputs | xargs -0 -r -n 1 -P "$FORKS" \
+    bash -c 'replay_one_input "$1" "$2" "$3" "$4"' _ "$COVERAGE_CMD" "$TIMEOUT" "$outdir" \
     >/dev/null 2>&1 || true
 
   if test "$INCLUDE_CRASHES" -eq 1; then
-    find_crash_timeout_files | xargs -0 -r -n 1 -P "$FORKS" \
-      bash -c 'run_input_command "$2" "$1" "$3"' _ "$COVERAGE_CMD" "$TIMEOUT" \
+    mkdir -p "$outdir/crash"
+    find_crash_timeout_files | number_inputs | xargs -0 -r -n 1 -P "$FORKS" \
+      bash -c 'replay_one_input "$1" "$2" "$3" "$4"' _ "$COVERAGE_CMD" "$TIMEOUT" "$outdir/crash" \
       >/dev/null 2>&1 || true
   fi
 }
@@ -1468,6 +1652,7 @@ cmd_search() {
   TARGET_LINE="${parsed##*$'\t'}"
 
   require_replay_commands "cov-analysis search" || exit 1
+  AFL_DIR="$(resolve_input_dir "$AFL_DIR")" || exit 1
   COV_BINARY="$(resolve_coverage_binary "$COVERAGE_CMD" "$BINARY_OVERRIDE")" || exit 1
 
   # Forgotten @@ on a driver binary → supply it automatically (argv-only input).
@@ -1528,7 +1713,7 @@ cmd_search() {
   _search_replay_union "$UNION_DIR"
 
   local praw_count
-  praw_count=$(find "$UNION_DIR" -name 'cov-*.profraw' -printf . 2>/dev/null | wc -c)
+  praw_count=$(find "$UNION_DIR" -name '*.profraw' -printf . 2>/dev/null | wc -c)
   if test "$praw_count" -eq 0; then
     err "No .profraw files generated."
     err "Check that the binary is instrumented with -fprofile-instr-generate."
@@ -2851,6 +3036,7 @@ cmd_report() {
   local BINARY_OVERRIDE=""
   local MIGRATE_EXISTING=0
   local STAGE_DIR=""
+  local MAX_REPLAY_FAILURES=99
 
   # ── argument parsing ───────────────────────────────────────────────────────
   if test $# -eq 0; then usage_report; exit 1; fi
@@ -2870,6 +3056,9 @@ cmd_report() {
       --layout)      need_arg "--layout" "${2-}"; FUZZER_LAYOUT="$2";       shift 2 ;;
       --reachability) need_arg "--reachability" "${2-}"; REACHABILITY="$2"; shift 2 ;;
       --binary)      need_arg "--binary" "${2-}"; BINARY_OVERRIDE="$2"; shift 2 ;;
+      --max-replay-failures)
+                     need_arg "--max-replay-failures" "${2-}"
+                     MAX_REPLAY_FAILURES="$2"; shift 2 ;;
       --migrate-existing-report) MIGRATE_EXISTING=1; shift ;;
       *) err "Unknown option: $1"; echo "" >&2; usage_report >&2; exit 1 ;;
     esac
@@ -2900,6 +3089,18 @@ cmd_report() {
       exit 1
       ;;
   esac
+  case "$MAX_REPLAY_FAILURES" in
+    ''|*[!0-9]*)
+      err "--max-replay-failures must be a percentage between 0 and 100: $MAX_REPLAY_FAILURES"
+      exit 1
+      ;;
+    *)
+      if test "$MAX_REPLAY_FAILURES" -gt 100; then
+        err "--max-replay-failures must be a percentage between 0 and 100: $MAX_REPLAY_FAILURES"
+        exit 1
+      fi
+      ;;
+  esac
 
   # Validate explicit --layout override if supplied
   if test -n "$FUZZER_LAYOUT"; then
@@ -2920,6 +3121,7 @@ cmd_report() {
   require_replay_commands "cov-analysis report" || exit 1
   require_coreutils_command mv "cov-analysis report" || exit 1
   require_coreutils_command realpath "cov-analysis report" || exit 1
+  AFL_DIR="$(resolve_input_dir "$AFL_DIR")" || exit 1
   if test -n "$REACHABILITY"; then
     require_command python3 "report --reachability" || exit 1
     if ! validate_reachability "$REACHABILITY"; then
@@ -3018,51 +3220,96 @@ cmd_report() {
   QUEUE_COUNT=$(count_files find_queue_files)
   log "Replaying $QUEUE_COUNT queue files..."
 
+  local IS_DRIVER=0
+  if is_cov_driver_binary "$COV_BINARY"; then IS_DRIVER=1; fi
+  local QUEUE_STATS="0 0 0 0 0"
+
   case "$COVERAGE_CMD" in
     *@@*)
       # Determine if @@ is the last token (enables fast batch mode)
       local LAST_TOKEN="${COVERAGE_CMD##* }"
       if test "$LAST_TOKEN" = "@@"; then
-        if ! is_cov_driver_binary "$COV_BINARY"; then
+        if test "$IS_DRIVER" -ne 1; then
           LAST_TOKEN="x"
         fi
       fi
       if test "$LAST_TOKEN" = "@@"; then
         # Fast batch: strip trailing @@ and let xargs append all files at once.
         # bash -c handles the same shell language as every other replay mode.
+        # Each batch profiles under its own prefix (so a reused PID cannot make
+        # one batch overwrite another's profile) and reports its exit status
+        # and size for the replay tally.
         local CMD_NO_AT="${COVERAGE_CMD% @@}"
         logv "Queue replay: batch (xargs, workers=$FORKS)"
+        export COV_PROFRAW_DIR="$PROFRAW_DIR"
         # shellcheck disable=SC2016
-        find_queue_files | xargs -0 -r -n 128 -P "$FORKS" \
-          bash -c "${CMD_NO_AT}"' "$@"' -- >/dev/null 2>&1 || true
+        QUEUE_STATS="$(find_queue_files | xargs -0 -r -n 128 -P "$FORKS" \
+          bash -c 'b="${1##*/}"; b="${b//[^A-Za-z0-9._-]/_}"
+                   export LLVM_PROFILE_FILE="$COV_PROFRAW_DIR/b_${b}-%p.profraw"
+                   '"${CMD_NO_AT}"' "$@" >/dev/null 2>&1; printf "%d %d\n" "$?" "$#"' -- \
+          | replay_tally "$IS_DRIVER" || true)"
       else
         # @@ is embedded mid-command (e.g. "./cov -f @@ -extra") — loop mode.
         logv "Queue replay: loop (mid-command @@, workers=$FORKS)"
-        export -f command_for_input run_input_command_unbounded
-        find_queue_files | xargs -0 -r -n 1 -P "$FORKS" \
-          bash -c 'run_input_command_unbounded "$1" "$2"' _ "$COVERAGE_CMD" \
-          >/dev/null 2>&1 || true
+        export -f command_for_input run_input_command_unbounded replay_one_input
+        QUEUE_STATS="$(find_queue_files | number_inputs | xargs -0 -r -n 1 -P "$FORKS" \
+          bash -c 'replay_one_input "$1" "$2" "$3" "$4"' _ "$COVERAGE_CMD" 0 "$PROFRAW_DIR" \
+          | replay_tally "$IS_DRIVER" || true)"
       fi
       ;;
     *)
       # No @@ — feed each file via stdin
       logv "Queue replay: stdin loop (workers=$FORKS)"
-      export -f command_for_input run_input_command_unbounded
-      find_queue_files | xargs -0 -r -n 1 -P "$FORKS" \
-        bash -c 'run_input_command_unbounded "$1" "$2"' _ "$COVERAGE_CMD" \
-        >/dev/null 2>&1 || true
+      export -f command_for_input run_input_command_unbounded replay_one_input
+      QUEUE_STATS="$(find_queue_files | number_inputs | xargs -0 -r -n 1 -P "$FORKS" \
+        bash -c 'replay_one_input "$1" "$2" "$3" "$4"' _ "$COVERAGE_CMD" 0 "$PROFRAW_DIR" \
+        | replay_tally "$IS_DRIVER" || true)"
       ;;
   esac
+
+  local Q_TOTAL=0 Q_OK=0 Q_FAILED=0 Q_KILLED=0 Q_UNREADABLE=0
+  read -r Q_TOTAL Q_OK Q_FAILED Q_KILLED Q_UNREADABLE <<< "$QUEUE_STATS" || true
+  log "Queue replay   : $Q_OK ok, $Q_FAILED failed, $Q_KILLED timed out (of $Q_TOTAL)"
+
+  if test "$Q_UNREADABLE" -gt 0; then
+    err "The coverage driver could not read $Q_UNREADABLE of $Q_TOTAL queue inputs."
+    err "Coverage from this run would be wrong. Check that the inputs still exist"
+    err "and that the target can open them (a target that chroots cannot)."
+    exit 1
+  fi
+  local Q_BAD=$((Q_FAILED + Q_KILLED))
+  if test "$Q_TOTAL" -gt 0 && test "$Q_BAD" -gt 0; then
+    local Q_PCT=$((Q_BAD * 100 / Q_TOTAL))
+    if test "$Q_PCT" -gt "$MAX_REPLAY_FAILURES"; then
+      err "$Q_BAD of $Q_TOTAL queue inputs did not replay cleanly (${Q_PCT}%, limit ${MAX_REPLAY_FAILURES}%)."
+      err "Coverage from this run would be wrong: the target did not process its inputs."
+      err "If the target legitimately exits non-zero for rejected inputs, raise the"
+      err "limit with --max-replay-failures 100."
+      exit 1
+    fi
+    err "Warning: $Q_BAD of $Q_TOTAL queue inputs did not replay cleanly."
+  fi
 
   # ── replay crashes and timeouts ────────────────────────────────────────────
   local CRASH_COUNT
   CRASH_COUNT=$(count_files find_crash_timeout_files)
   if test "$CRASH_COUNT" -gt 0; then
     log "Replaying $CRASH_COUNT crash/timeout files (timeout=${TIMEOUT}s each)..."
-    export -f run_with_timeout command_for_input run_input_command
-    find_crash_timeout_files | xargs -0 -r -n 1 -P "$FORKS" \
-      bash -c 'run_input_command "$2" "$1" "$3"' _ "$COVERAGE_CMD" "$TIMEOUT" \
-      >/dev/null 2>&1 || true
+    export -f run_with_timeout command_for_input run_input_command \
+      run_input_command_unbounded replay_one_input
+    local CRASH_PROFRAW_DIR="$PROFRAW_DIR/crash"
+    mkdir -p "$CRASH_PROFRAW_DIR"
+    local CRASH_STATS
+    CRASH_STATS="$(find_crash_timeout_files | number_inputs | xargs -0 -r -n 1 -P "$FORKS" \
+      bash -c 'replay_one_input "$1" "$2" "$3" "$4"' \
+      _ "$COVERAGE_CMD" "$TIMEOUT" "$CRASH_PROFRAW_DIR" | replay_tally "$IS_DRIVER" || true)"
+    local C_TOTAL=0 C_OK=0 C_FAILED=0 C_KILLED=0 C_UNREADABLE=0
+    read -r C_TOTAL C_OK C_FAILED C_KILLED C_UNREADABLE <<< "$CRASH_STATS" || true
+    # Crash and timeout inputs are expected to die; they never fail the run.
+    log "Crash replay   : $C_OK ok, $C_FAILED failed, $C_KILLED timed out (of $C_TOTAL)"
+    if test "$C_UNREADABLE" -gt 0; then
+      err "Warning: the coverage driver could not read $C_UNREADABLE of $C_TOTAL crash/timeout inputs."
+    fi
   fi
 
   # ── check profraw files were generated ────────────────────────────────────

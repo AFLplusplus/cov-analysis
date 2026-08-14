@@ -68,6 +68,14 @@ Only regular files are selected. Directories and symlinks are never counted or
 replayed. For libFuzzer, libafl and honggfuzz, crash-like files are replayed
 under the `-T` hard deadline so a hanging input cannot stall the run.
 
+Inputs are always handed to the target as absolute paths, so a harness that
+changes its working directory (a sandbox `chdir()`, for example) still finds
+them. Every replay is accounted for: `report` and `stability` print how many
+inputs replayed cleanly, failed, or hit the deadline, and `report` refuses to
+publish a report when more of the queue failed than `--max-replay-failures`
+allows — a target that never processed its inputs produces a wrong number, not
+a low one.
+
 Override auto-detection with `--layout afl|flat`.
 
 ## Workflow
@@ -338,6 +346,14 @@ successful passes. Lines that are zero or absent in every pass are excluded;
 a zero/absent-to-positive transition is included and classified unstable. If no
 line executes in any successful pass, stability is `n/a`.
 
+Every analyzed pass measures the same inputs. An input killed at the `-T`
+deadline never writes its profile, so it contributes nothing to that pass —
+under `-t` contention a borderline input crosses the deadline in some passes and
+not others, and every line only it covers would flip between 0 and N. Such
+inputs are excluded from **all** passes and reported as
+`Inputs used : K of N`, so the verdict does not depend on `-t`. If no input
+survives every pass, the run fails instead of reporting a meaningless number.
+
 This will give you the exact lines that are problematic, e.g.:
 ```
 Stability Report
@@ -433,6 +449,11 @@ Optional:
   --binary <path>    Instrumented binary for LLVM and driver detection;
                      required when -e has quoted paths, wrappers, or shell syntax
   --layout <kind>    Force layout: 'afl' or 'flat' (default: auto-detect)
+  --max-replay-failures <pct>
+                     Fail the run when more than <pct> percent of the queue
+                     inputs did not replay cleanly (default: 99). Crash and
+                     timeout inputs are exempt. Use 100 for targets that
+                     legitimately exit non-zero for rejected inputs.
   --ignore-regex <r> Filename regex to exclude from llvm-cov reports
                      (default: /usr/include/)
   --reachability <p> Cross-reference fuzz-reachability output (its JSON report,
@@ -474,6 +495,11 @@ Usage: cov-analysis driver [-o output.c]
   for each, and makes a best-effort crash-time profile flush before
   re-raising the original signal. The profile writer is not async-signal-safe.
 
+  Input paths are resolved to absolute paths before the harness runs, so a
+  harness that changes its working directory still finds them. Unreadable
+  inputs are reported on stderr and make the driver exit 2; empty inputs are
+  reported but are not an error.
+
 Options:
   -o <file>     Write driver source to FILE instead of stdout
 ```
@@ -511,6 +537,11 @@ Usage: cov-analysis stability [options]
   skipped and the run continues with the remaining passes, as long as at
   least 2 passes succeed.
 
+  Every analyzed pass measures the same inputs: an input killed at the -T
+  deadline writes no profile, so it is excluded from ALL passes and reported.
+  The verdict does not depend on -t. If no input survives every pass, the run
+  fails instead of reporting a meaningless number.
+
 Required:
   -d <dir>    Fuzzing output directory (AFL++, libFuzzer, libafl, or honggfuzz)
   -e <cmd>    Coverage command. Use @@ as input file placeholder.
@@ -532,7 +563,7 @@ Optional:
   -h, --help         Print this help and exit
 ```
 
-The command outputs a **Stability Report** showing corpus size, number of runs, and the stability percentage (stable executed lines / total executed lines). If unstable lines are found, they are listed with file paths and line number ranges. If any pass failed to collect or merge its profiles, it is skipped and the report notes how many runs were actually analyzed.
+The command outputs a **Stability Report** showing corpus size, number of runs, and the stability percentage (stable executed lines / total executed lines). If unstable lines are found, they are listed with file paths and line number ranges. If any pass failed to collect or merge its profiles, it is skipped and the report notes how many runs were actually analyzed. If inputs were excluded because they did not produce coverage in every pass, the report adds an `Inputs used` line.
 
 Examples:
 

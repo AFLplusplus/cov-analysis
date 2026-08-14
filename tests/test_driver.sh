@@ -57,6 +57,54 @@ else
   echo "[SKIP] crash-time profile output unavailable on this profiling runtime"
 fi
 
+# A harness that chdir()s must not invalidate the relative paths it was handed.
+mkdir -p "$TMP/sandbox" "$TMP/rel"
+printf a > "$TMP/rel/a"
+printf b > "$TMP/rel/b"
+: > "$TMP/rel/zerolen"
+cat > "$TMP/harness_chdir.c" <<'EOF'
+#include <stddef.h>
+#include <stdlib.h>
+#include <unistd.h>
+int LLVMFuzzerInitialize(int *argc, char ***argv) {
+  const char *s = getenv("SANDBOX");
+  (void)argc; (void)argv;
+  if (s && chdir(s) != 0) _exit(3);
+  return 0;
+}
+int LLVMFuzzerTestOneInput(const unsigned char *data, size_t size) {
+  (void)data;
+  return size > 0 ? 0 : 0;
+}
+EOF
+"$CLANG" -fprofile-instr-generate -fcoverage-mapping "$DRIVER" "$TMP/harness_chdir.c" \
+  -o "$TMP/cov2" || die "chdir harness compilation failed"
+
+out=$(cd "$TMP/rel" && LLVM_PROFILE_FILE="$TMP/chdir.profraw" SANDBOX="$TMP/sandbox" \
+  "$TMP/cov2" a b 2>&1)
+rc=$?
+assert_eq "$rc" "0" "driver failed on relative paths after the harness chdir()ed: $out"
+n=$(printf '%s\n' "$out" | grep -c '^Running: ')
+assert_eq "$n" "2" "driver did not process both inputs after the harness chdir()ed: $out"
+
+out=$(LLVM_PROFILE_FILE="$TMP/missing.profraw" "$TMP/cov" "$TMP/does-not-exist" 2>&1)
+rc=$?
+assert_eq "$rc" "2" "driver must fail when an input cannot be read: $out"
+printf '%s\n' "$out" | grep -q 'does-not-exist' \
+  || die "driver did not name the unreadable input: $out"
+
+out=$(LLVM_PROFILE_FILE="$TMP/zerolen.profraw" "$TMP/cov" "$TMP/rel/zerolen" 2>&1)
+rc=$?
+assert_eq "$rc" "0" "an empty input must not fail the driver: $out"
+printf '%s\n' "$out" | grep -q 'empty input' \
+  || die "driver did not report the empty input: $out"
+
+out=$("$TMP/cov" --printsignature 2>&1)
+rc=$?
+assert_eq "$rc" "0" "--printsignature must exit 0 so driver detection keeps working: $out"
+printf '%s\n' "$out" | grep -q 'SIGNATURE_LLVMFUZZERTESTONEINPUT_COVERAGE' \
+  || die "--printsignature no longer prints the detection signature: $out"
+
 "$CLANG" -MJ "$TMP/entry.json" -fprofile-instr-generate -fcoverage-mapping \
   -c "$DRIVER" -o "$TMP/coverage_driver.o" || die "driver compilation-database probe failed"
 {
