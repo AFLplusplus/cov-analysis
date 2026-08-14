@@ -394,6 +394,12 @@ owned_report() {
   test "$first" = "cov-analysis-report-v1"
 }
 
+validate_staged_profdata() {
+  local dir="$1"
+  owned_report "$dir" || return 1
+  test -s "$dir/coverage.profdata" || return 1
+}
+
 validate_staged_report() {
   local dir="$1" reachability="$2"
   owned_report "$dir" || return 1
@@ -889,7 +895,20 @@ Required:
               driver binary (which reads files, not stdin), @@ is appended
               automatically when omitted.
 
+Multiple campaigns:
+  Repeat -d/-e to analyze several harnesses in one run. Each -d starts a new
+  campaign; -e, --binary and --name attach to the campaign started by the most
+  recent -d. A single -d/-e pair behaves exactly as before. With two or more,
+  <-o> holds one full report per campaign, a union report over all of them
+  (every binary is passed to llvm-cov as its own object), and a per-file
+  attribution table naming the best campaign per file and the lines only one
+  campaign reached. Campaign binaries built from different sources are
+  reported: llvm-cov keeps one coverage mapping and drops the functions that
+  differ, which would under-report the union.
+
 Optional:
+  --name <name>      Directory name for the campaign started by the last -d
+                     (default: the basename of that directory)
   -o <dir>           Report output directory (default: <afl-dir>/cov)
   -t <num>           Parallel replay workers/forks (default: 1)
   -T <secs>          Timeout in seconds for crash/timeout replay (default: 5)
@@ -928,6 +947,26 @@ Optional:
                      flat — without directory grouping — so its numbers can be
                      rewritten reliably.) Invalid input, per-function metrics,
                      or annotation failures make the report command fail.
+  --replay-only      Replay and merge, write coverage.profdata into <-o>, and
+                     stop without rendering a report. Use it to replay a corpus
+                     where it lives and carry back only the merged profile.
+  --profdata <file>  Render from profile data instead of replaying a corpus.
+                     Repeatable; several profiles are merged into one report.
+                     Needs -o and the instrumented binary (--binary or -e), and
+                     -d is not used. Also re-renders an existing report with a
+                     different --ignore-regex or fresh --reachability data.
+  --remote <host>    Replay on [user@]host and fetch only the merged profile,
+                     instead of copying the corpus here. -d and -e name paths
+                     on that host; --binary names the matching LOCAL binary,
+                     used for rendering, and -o is required. cov-analysis
+                     copies itself over, runs --replay-only there, brings back
+                     coverage.profdata, and removes its remote working
+                     directory on success and on failure. Needs ssh and scp.
+  --ssh-opts <opts>  Options handed to both ssh and scp (e.g.
+                     "-o Port=2222 -o IdentityFile=~/.ssh/fuzz"). Use the
+                     -o Key=Value form: ssh and scp disagree about -p.
+  --remote-dir <dir> Remote working directory (default: a mktemp -d under the
+                     remote TMPDIR)
   --migrate-existing-report
                      Replace a complete pre-marker cov-analysis report after a
                      successful staged run. Without this explicit option, a
@@ -953,6 +992,19 @@ Examples:
 
   # Replay coverage with 8 parallel workers
   cov-analysis -d out -e "./cov @@" -t 8
+
+  # Several harnesses over one library: per-harness, union, and attribution
+  cov-analysis -d out-parser -e "./cov-parser @@" --name parser \
+               -d out-decoder -e "./cov-decoder @@" --name decoder \
+               -o coverage
+
+  # Replay on the machine that holds the corpus, render where you read it
+  cov-analysis -d out -e "./cov @@" -o profile --replay-only
+  cov-analysis --profdata profile/coverage.profdata --binary ./cov -o coverage
+
+  # The same in one command, over ssh: no corpus is copied
+  cov-analysis --remote fuzzbox -d /fuzz/out -e "/fuzz/cov @@" \
+    --binary ./cov -o coverage
 
   # stdin input (binary reads from stdin)
   cov-analysis -d out -e "./cov"
@@ -3217,6 +3269,532 @@ PYEOF
   } | python3 - "$COVJSON" "$REACH" "$HTML_DIR" "$TEXT_DIR" "$SUMMARY" "$PERFUNC" "$VERDICTS"
 }
 
+render_coverage_report() {
+  local llvm_cov="$1" dest="$2" profdata="$3" ignore="$4" reach="$5" work="$6"
+  shift 6
+  local primary="$1"
+  shift
+  local -a objects=()
+  local b
+  for b in "$@"; do objects+=("-object" "$b"); done
+
+  mkdir -p "$dest/html" "$dest/text"
+
+  local -a SHOW_OPTS=(
+    "$primary"
+    ${objects[@]+"${objects[@]}"}
+    "-instr-profile=$profdata"
+    "-show-directory-coverage"
+    "-show-line-counts-or-regions"
+    "-show-branches=count"
+    "-ignore-filename-regex=$ignore"
+  )
+
+  # With --reachability the HTML index is rewritten with reachable-only numbers,
+  # which needs the flat single-table index — so drop -show-directory-coverage
+  # (its hierarchical multi-index layout) for the HTML output in that case.
+  local -a HTML_SHOW_OPTS=("${SHOW_OPTS[@]}")
+  if test -n "$reach"; then
+    local _o; local -a _filtered=()
+    for _o in "${HTML_SHOW_OPTS[@]}"; do
+      test "$_o" = "-show-directory-coverage" && continue
+      _filtered+=("$_o")
+    done
+    HTML_SHOW_OPTS=("${_filtered[@]}")
+  fi
+
+  log "Generating HTML report..."
+  "$llvm_cov" show "${HTML_SHOW_OPTS[@]}" \
+    -format=html \
+    -output-dir="$dest/html" || {
+    err "llvm-cov show (HTML) failed"
+    return 1
+  }
+
+  log "Generating text report..."
+  "$llvm_cov" show "${SHOW_OPTS[@]}" \
+    -format=text \
+    -use-color=false \
+    -output-dir="$dest/text" || {
+    err "llvm-cov show (text) failed"
+    return 1
+  }
+
+  log "Generating summary..."
+  "$llvm_cov" report "$primary" ${objects[@]+"${objects[@]}"} \
+    "-instr-profile=$profdata" \
+    "-ignore-filename-regex=$ignore" \
+    > "$dest/summary.txt" || {
+    err "llvm-cov report failed"
+    return 1
+  }
+
+  log "Generating JSON export..."
+  # llvm-cov quirk: --format=text emits JSON; --format=lcov emits LCOV.
+  "$llvm_cov" export "$primary" ${objects[@]+"${objects[@]}"} \
+    --format=text \
+    "-instr-profile=$profdata" \
+    "-ignore-filename-regex=$ignore" \
+    > "$dest/coverage.json" || {
+    err "llvm-cov export failed"
+    return 1
+  }
+
+  # ── per-function metrics ───────────────────────────────────────────────────
+  # They feed the gap inventory, and let the reachability annotator recompute
+  # Function/Line/Region/Branch coverage excluding unreachable functions.
+  local perfunc="$work/perfunc.txt"
+  local response="$work/sources.rsp"
+  : > "$perfunc"
+  if write_source_response "$dest/coverage.json" "$response" 2>/dev/null; then
+    if ! "$llvm_cov" report "$primary" ${objects[@]+"${objects[@]}"} \
+      "-instr-profile=$profdata" \
+      "-ignore-filename-regex=$ignore" \
+      -show-functions "@$response" > "$perfunc"; then
+      err "llvm-cov per-function report failed."
+      return 1
+    fi
+    if ! test -s "$perfunc"; then
+      err "llvm-cov per-function report was empty."
+      return 1
+    fi
+  elif test -n "$reach"; then
+    err "Could not build the source response file for reachable-only metrics."
+    return 1
+  else
+    logv "Coverage export lists no source files; the gap inventory will be empty."
+  fi
+
+  # ── reachability annotation (optional) ─────────────────────────────────────
+  local verdicts=""
+  if test -n "$reach"; then
+    log "Annotating reports with reachability..."
+    verdicts="$work/verdicts.tsv"
+    local tally=""
+    if ! tally="$(annotate_reachability "$dest/coverage.json" "$reach" \
+         "$dest/html" "$dest/text" "$dest/summary.txt" "$perfunc" "$verdicts")"; then
+      err "Reachability annotation failed."
+      return 1
+    fi
+    log "Reachability: $tally"
+  fi
+
+  # ── gap inventory ──────────────────────────────────────────────────────────
+  log "Building gap inventory..."
+  if ! write_gap_inventory "$perfunc" "$dest/gaps.txt" "$verdicts"; then
+    err "Could not build the gap inventory."
+    return 1
+  fi
+}
+
+# Replays on the host that holds the corpus and fetches only the merged
+# profile. -d and -e name REMOTE paths; the binary used for rendering is local.
+# Prints nothing; the fetched profile lands at $2.
+run_remote_replay() {
+  local host="$1" fetched="$2" opts="$3" remote_dir="$4"
+  local script rd rc=0
+  local -a sshopts=()
+  test -n "$opts" && read -r -a sshopts <<< "$opts"
+
+  script="$(realpath -e -- "${BASH_SOURCE[0]}" 2>/dev/null)" || {
+    err "Could not locate the cov-analysis script to copy to $host."
+    return 1
+  }
+
+  if test -n "$remote_dir"; then
+    rd="$remote_dir"
+    ssh ${sshopts[@]+"${sshopts[@]}"} "$host" \
+      "mkdir -p -- $(printf '%q' "$rd")" || {
+      err "Could not create the remote working directory on $host: $rd"
+      return 1
+    }
+  else
+    rd="$(ssh ${sshopts[@]+"${sshopts[@]}"} "$host" \
+      'mktemp -d "${TMPDIR:-/tmp}/cov-analysis-remote.XXXXXX"')" || {
+      err "Could not create a remote working directory on $host."
+      return 1
+    }
+  fi
+  if test -z "$rd"; then
+    err "The remote working directory path came back empty from $host."
+    return 1
+  fi
+  logv "Remote work dir : $host:$rd"
+
+  _remote_cleanup() {
+    ssh ${sshopts[@]+"${sshopts[@]}"} "$host" \
+      "rm -rf -- $(printf '%q' "$rd")" >/dev/null 2>&1 || true
+  }
+
+  log "Copying cov-analysis to $host..."
+  if ! scp ${sshopts[@]+"${sshopts[@]}"} "$script" \
+       "$host:$(printf '%q' "$rd/cov-analysis")"; then
+    err "Could not copy cov-analysis to $host."
+    _remote_cleanup
+    return 1
+  fi
+
+  local remote_cmd
+  remote_cmd="bash $(printf '%q' "$rd/cov-analysis") report"
+  remote_cmd="$remote_cmd -d $(printf '%q' "$AFL_DIR")"
+  remote_cmd="$remote_cmd -e $(printf '%q' "$COVERAGE_CMD")"
+  remote_cmd="$remote_cmd -o $(printf '%q' "$rd/out")"
+  remote_cmd="$remote_cmd --replay-only -t $FORKS -T $TIMEOUT"
+  remote_cmd="$remote_cmd --max-replay-failures $MAX_REPLAY_FAILURES"
+  test -n "$FUZZER_LAYOUT" && remote_cmd="$remote_cmd --layout $FUZZER_LAYOUT"
+  test "$QUIET" -eq 1 && remote_cmd="$remote_cmd -q"
+  test "$VERBOSE" -eq 1 && remote_cmd="$remote_cmd -v"
+
+  log "Replaying on $host..."
+  if ! ssh ${sshopts[@]+"${sshopts[@]}"} "$host" "$remote_cmd"; then
+    err "Remote replay failed on $host."
+    _remote_cleanup
+    return 1
+  fi
+
+  log "Fetching the merged profile from $host..."
+  if ! scp ${sshopts[@]+"${sshopts[@]}"} \
+       "$host:$(printf '%q' "$rd/out/coverage.profdata")" "$fetched"; then
+    err "Could not fetch coverage.profdata from $host."
+    _remote_cleanup
+    return 1
+  fi
+  _remote_cleanup
+  if ! test -s "$fetched"; then
+    err "The profile fetched from $host is empty."
+    return 1
+  fi
+  return "$rc"
+}
+# write_attribution <out.txt> <out.html> <mismatch.txt> <name=lcov> [...]
+write_attribution() {
+  local out_txt="$1" out_html="$2" out_mismatch="$3"
+  shift 3
+  python3 - "$out_txt" "$out_html" "$out_mismatch" "$@" <<'PYEOF'
+#
+# (c) 2026 Marc "vanHauser" Heuse
+#
+# License: GNU Affero General Public License 3
+#
+
+import html as htmlmod
+import sys
+
+out_txt, out_html, out_mismatch = sys.argv[1], sys.argv[2], sys.argv[3]
+campaigns = []
+for arg in sys.argv[4:]:
+    name, _, path = arg.partition('=')
+    campaigns.append((name, path))
+
+# file -> line -> set of campaign indexes that executed it; plus every
+# instrumented line, so a file only one campaign knows still gets a total.
+instrumented = {}
+covered = {}
+# Per campaign, a fingerprint of how a file is instrumented: its line, branch
+# and function records. Two binaries built from different sources differ here
+# even when they instrument the same line numbers.
+per_campaign_shape = {}
+
+
+def parse_lcov(path, index):
+    current = None
+    with open(path, 'r', encoding='utf-8', errors='replace') as handle:
+        for raw in handle:
+            line = raw.rstrip('\n')
+            if line.startswith('SF:'):
+                current = line[3:]
+                instrumented.setdefault(current, set())
+                covered.setdefault(current, {})
+                per_campaign_shape.setdefault(current, {}).setdefault(
+                    campaigns[index][0], set())
+            elif line.startswith('DA:') and current is not None:
+                body = line[3:].split(',')
+                if len(body) < 2:
+                    continue
+                try:
+                    number, count = int(body[0]), int(body[1])
+                except ValueError:
+                    continue
+                instrumented[current].add(number)
+                per_campaign_shape[current][campaigns[index][0]].add(('D', number))
+                if count > 0:
+                    covered[current].setdefault(number, set()).add(index)
+            elif line.startswith('BRDA:') and current is not None:
+                body = line[5:].split(',')
+                if len(body) >= 3:
+                    per_campaign_shape[current][campaigns[index][0]].add(
+                        ('B', body[0], body[1], body[2]))
+            elif line.startswith('FN:') and current is not None:
+                per_campaign_shape[current][campaigns[index][0]].add(
+                    ('F', line[3:]))
+            elif line == 'end_of_record':
+                current = None
+
+
+for index, (name, path) in enumerate(campaigns):
+    parse_lcov(path, index)
+
+rows = []
+for path in sorted(instrumented):
+    total = len(instrumented[path])
+    if total == 0:
+        continue
+    per_campaign = []
+    for index, (name, _) in enumerate(campaigns):
+        hit = sum(1 for owners in covered[path].values() if index in owners)
+        only = sum(1 for owners in covered[path].values()
+                   if owners == {index})
+        per_campaign.append({'name': name, 'covered': hit, 'unique': only})
+    best = max(per_campaign, key=lambda entry: entry['covered'])
+    union = len(covered[path])
+    rows.append({'file': path, 'total': total, 'union': union,
+                 'best': best['name'] if best['covered'] > 0 else '-',
+                 'campaigns': per_campaign})
+
+
+def percent(part, whole):
+    return 0.0 if whole == 0 else 100.0 * part / whole
+
+
+# Two binaries built from different sources instrument different lines of the
+# same file. llvm-cov keeps only one mapping and silently drops the functions
+# whose mapping differs, so the union under-reports without saying so.
+with open(out_mismatch, 'w', encoding='utf-8') as handle:
+    for path in sorted(per_campaign_shape):
+        seen = per_campaign_shape[path]
+        shapes = {}
+        for name, records in seen.items():
+            shapes.setdefault(frozenset(records), []).append(name)
+        if len(shapes) > 1:
+            described = '; '.join(
+                '%s: %d coverage records' % ('/'.join(sorted(names)), len(shape))
+                for shape, names in sorted(shapes.items(),
+                                           key=lambda item: sorted(item[1])))
+            handle.write('%s -- %s\n' % (path, described))
+
+
+with open(out_txt, 'w', encoding='utf-8') as handle:
+    handle.write('Per-file attribution across %d campaigns\n' % len(campaigns))
+    handle.write('=' * 39 + '\n\n')
+    handle.write('For every source file: how many instrumented lines each campaign\n')
+    handle.write('covered, and how many of those NO other campaign reached. A file\n')
+    handle.write('whose lines are all unique to one campaign is covered by that\n')
+    handle.write('harness alone - losing it loses the coverage.\n\n')
+    for row in rows:
+        handle.write('%s  (%d instrumented lines, %d covered by the union)\n'
+                     % (row['file'], row['total'], row['union']))
+        handle.write('    best: %s\n' % row['best'])
+        for entry in row['campaigns']:
+            handle.write('    %s %d covered, %d unique, %.2f%%\n'
+                         % (entry['name'], entry['covered'], entry['unique'],
+                            percent(entry['covered'], row['total'])))
+        handle.write('\n')
+    if not rows:
+        handle.write('(no instrumented lines found in any campaign)\n')
+
+with open(out_html, 'w', encoding='utf-8') as handle:
+    handle.write('<!DOCTYPE html>\n<html><head><meta charset="utf-8">\n')
+    handle.write('<title>cov-analysis campaign attribution</title>\n')
+    handle.write('<style>\n'
+                 'body{font-family:sans-serif;margin:2em;background:#fff;color:#222}\n'
+                 'table{border-collapse:collapse;width:100%}\n'
+                 'th,td{border:1px solid #ccc;padding:4px 8px;text-align:right}\n'
+                 'th:first-child,td:first-child{text-align:left;font-family:monospace}\n'
+                 'th{background:#eee}\n'
+                 'td.best{background:#d8f0d8;font-weight:bold}\n'
+                 'td.uniq{color:#8a4b00}\n'
+                 '</style></head><body>\n')
+    handle.write('<h1>Campaign attribution</h1>\n')
+    handle.write('<p>Lines covered per campaign, and lines only that campaign '
+                 'reached. The best campaign per file is highlighted.</p>\n')
+    handle.write('<table>\n<tr><th>File</th><th>Instrumented</th><th>Union</th>')
+    for name, _ in campaigns:
+        handle.write('<th>%s</th><th>%s unique</th>'
+                     % (htmlmod.escape(name), htmlmod.escape(name)))
+    handle.write('</tr>\n')
+    for row in rows:
+        handle.write('<tr><td>%s</td><td>%d</td><td>%d</td>'
+                     % (htmlmod.escape(row['file']), row['total'], row['union']))
+        for entry in row['campaigns']:
+            css = ' class="best"' if entry['name'] == row['best'] else ''
+            handle.write('<td%s>%d</td><td class="uniq">%d</td>'
+                         % (css, entry['covered'], entry['unique']))
+        handle.write('</tr>\n')
+    handle.write('</table>\n</body></html>\n')
+PYEOF
+}
+_list_contains() {
+  local needle="$1"
+  shift
+  local item
+  for item in "$@"; do
+    test "$item" = "$needle" && return 0
+  done
+  return 1
+}
+
+# Runs one full report per campaign, then a union report over all of them and a
+# per-file attribution table. Reads cmd_report's CAMP_* arrays and options.
+run_multi_campaign() {
+  local count="${#CAMP_DIRS[@]}" i
+  local -a names=() bins=() profdatas=()
+
+  for ((i = 0; i < count; i++)); do
+    if test -z "${CAMP_DIRS[$i]}"; then
+      err "Campaign $((i + 1)) has no input directory (-d)."
+      return 1
+    fi
+    if test -z "${CAMP_CMDS[$i]}"; then
+      err "Campaign $((i + 1)) (${CAMP_DIRS[$i]}) has no coverage command (-e)."
+      return 1
+    fi
+    if ! test -d "${CAMP_DIRS[$i]}"; then
+      err "Campaign input directory does not exist: ${CAMP_DIRS[$i]}"
+      return 1
+    fi
+    local n base k
+    n="${CAMP_NAMES[$i]}"
+    test -z "$n" && n="$(basename -- "${CAMP_DIRS[$i]}")"
+    n="${n//[^A-Za-z0-9._-]/_}"
+    test -z "$n" && n="campaign$((i + 1))"
+    base="$n"; k=2
+    # union/, attribution.* and the marker are the run's own artifacts
+    while _list_contains "$n" ${names[@]+"${names[@]}"} \
+          union attribution.txt attribution.html "$REPORT_MARKER_NAME"; do
+      n="${base}-${k}"; k=$((k + 1))
+    done
+    test "$n" = "${CAMP_NAMES[$i]}" || test -z "${CAMP_NAMES[$i]}" \
+      || log "Campaign name '${CAMP_NAMES[$i]}' is reserved; using '$n'"
+    names+=("$n")
+  done
+
+  local stage work
+  stage="$(mktemp -d "$REPORT_PARENT/.${REPORT_BASE}.cov-analysis.stage.XXXXXX")" || return 1
+  work="$(mktemp -d "$(tmp_base_dir)/cov-analysis-union.XXXXXX")" || return 1
+  COV_REPORT_CLEAN_STAGE="$stage"
+  COV_REPORT_CLEAN_PROFRAW="$work"
+  trap cleanup_report_work EXIT INT TERM
+  printf 'cov-analysis-report-v1\n' > "$stage/$REPORT_MARKER_NAME"
+
+  log "Campaigns       : $count"
+  log "Report directory: $REPORT_DIR"
+
+  for ((i = 0; i < count; i++)); do
+    log ""
+    log "== Campaign ${names[$i]} (${CAMP_DIRS[$i]}) =="
+    local -a argv=(-d "${CAMP_DIRS[$i]}" -e "${CAMP_CMDS[$i]}" -o "$stage/${names[$i]}"
+                   -t "$FORKS" -T "$TIMEOUT" --ignore-regex "$IGNORE_REGEX"
+                   --max-replay-failures "$MAX_REPLAY_FAILURES")
+    test -n "${CAMP_BINS[$i]}" && argv+=(--binary "${CAMP_BINS[$i]}")
+    test -n "$REACHABILITY" && argv+=(--reachability "$REACHABILITY")
+    test -n "$FUZZER_LAYOUT" && argv+=(--layout "$FUZZER_LAYOUT")
+    test "$QUIET" -eq 1 && argv+=(-q)
+    test "$VERBOSE" -eq 1 && argv+=(-v)
+    if ! ( cmd_report "${argv[@]}" ); then
+      err "Campaign ${names[$i]} failed; nothing was published."
+      return 1
+    fi
+    local resolved
+    resolved="$(resolve_coverage_binary "${CAMP_CMDS[$i]}" "${CAMP_BINS[$i]}")" || return 1
+    bins+=("$resolved")
+    profdatas+=("$stage/${names[$i]}/coverage.profdata")
+  done
+
+  # ── union over every campaign ──────────────────────────────────────────────
+  log ""
+  log "== Union of $count campaigns =="
+  local -a ubins=()
+  local b
+  for b in "${bins[@]}"; do
+    _list_contains "$b" ${ubins[@]+"${ubins[@]}"} || ubins+=("$b")
+  done
+  local -a uobjects=()
+  for ((i = 1; i < ${#ubins[@]}; i++)); do uobjects+=("-object" "${ubins[$i]}"); done
+
+  mkdir -p "$stage/union"
+  printf 'cov-analysis-report-v1\n' > "$stage/union/$REPORT_MARKER_NAME"
+  printf '%s\n' "${profdatas[@]}" > "$work/profdata.manifest"
+  log "Merging $count campaign profile(s)..."
+  merge_profiles "$LLVM_PROFDATA" "$work" "$stage/union/coverage.profdata" \
+    "" "$work/profdata.manifest" || {
+    err "llvm-profdata merge of the campaign profiles failed"
+    return 1
+  }
+
+  # llvm-cov silently drops a function whose coverage mapping differs between
+  # two campaign binaries, which under-reports the union. Surface its warning.
+  "$LLVM_COV" report "${ubins[0]}" ${uobjects[@]+"${uobjects[@]}"} \
+    "-instr-profile=$stage/union/coverage.profdata" \
+    "-ignore-filename-regex=$IGNORE_REGEX" >/dev/null 2>"$work/objects.log" || true
+  if grep -qiE 'mismatch|out of date|malformed|does not match' "$work/objects.log"; then
+    err "Warning: coverage-mapping mismatch between the campaign binaries:"
+    sed 's/^/    /' "$work/objects.log" >&2
+    err "Functions whose mapping differs between binaries are dropped from the union."
+    err "Rebuild every campaign binary from the same sources to get a complete union."
+  fi
+
+  if ! render_coverage_report "$LLVM_COV" "$stage/union" \
+       "$stage/union/coverage.profdata" "$IGNORE_REGEX" "$REACHABILITY" "$work" \
+       "${ubins[@]}"; then
+    return 1
+  fi
+  if ! validate_staged_report "$stage/union" "$REACHABILITY"; then
+    err "The staged union report is incomplete or invalid."
+    return 1
+  fi
+
+  # ── per-file attribution ───────────────────────────────────────────────────
+  log ""
+  log "Building per-file attribution..."
+  local -a pairs=()
+  for ((i = 0; i < count; i++)); do
+    if ! "$LLVM_COV" export "${bins[$i]}" --format=lcov \
+         "-instr-profile=${profdatas[$i]}" \
+         "-ignore-filename-regex=$IGNORE_REGEX" > "$work/${names[$i]}.lcov"; then
+      err "llvm-cov export (lcov) failed for campaign ${names[$i]}"
+      return 1
+    fi
+    pairs+=("${names[$i]}=$work/${names[$i]}.lcov")
+  done
+  if ! write_attribution "$stage/attribution.txt" "$stage/attribution.html" \
+       "$work/mapping-mismatch.txt" "${pairs[@]}"; then
+    err "Could not build the attribution table."
+    return 1
+  fi
+  if test -s "$work/mapping-mismatch.txt"; then
+    err "Warning: coverage-mapping mismatch between the campaign binaries."
+    err "These files are instrumented differently in different campaigns:"
+    sed 's/^/    /' "$work/mapping-mismatch.txt" >&2
+    err "The binaries were built from different sources. llvm-cov keeps one"
+    err "mapping and drops the functions that differ, so the union under-reports."
+    err "Rebuild every campaign binary from the same sources."
+  fi
+
+  for ((i = 0; i < count; i++)); do
+    if ! owned_report "$stage/${names[$i]}"; then
+      err "Campaign report ${names[$i]} is incomplete."
+      return 1
+    fi
+  done
+  test -s "$stage/attribution.txt" || { err "Attribution table is empty."; return 1; }
+
+  if ! publish_report "$stage" "$REPORT_DIR"; then
+    return 1
+  fi
+  COV_REPORT_CLEAN_STAGE=""
+
+  if test "$QUIET" -eq 0; then
+    echo ""
+    for ((i = 0; i < count; i++)); do
+      echo "[+] ${names[$i]} report : $REPORT_DIR/${names[$i]}/html/index.html"
+    done
+    echo "[+] Union report : file://$REPORT_DIR/union/html/index.html"
+    echo "[+] Union gaps   : $REPORT_DIR/union/gaps.txt"
+    echo "[+] Attribution  : $REPORT_DIR/attribution.txt"
+    echo "[+] Attribution  : file://$REPORT_DIR/attribution.html"
+  fi
+  return 0
+}
 # ── command: report ───────────────────────────────────────────────────────────
 
 cmd_report() {
@@ -3236,14 +3814,45 @@ cmd_report() {
   local MIGRATE_EXISTING=0
   local STAGE_DIR=""
   local MAX_REPLAY_FAILURES=99
+  local REPLAY_ONLY=0
+  local REMOTE_HOST=""
+  local SSH_OPTS=""
+  local REMOTE_DIR=""
+  local -a PROFDATA_INPUTS=()
+  local -a CAMP_DIRS=() CAMP_CMDS=() CAMP_BINS=() CAMP_NAMES=()
+
+  # -d starts a campaign; -e, --binary and --name attach to the most recent one.
+  _camp_slot() {
+    if test "${#CAMP_DIRS[@]}" -eq 0; then
+      CAMP_DIRS+=(""); CAMP_CMDS+=(""); CAMP_BINS+=(""); CAMP_NAMES+=("")
+    fi
+  }
+  _camp_set() {
+    local field="$1" value="$2" last
+    _camp_slot
+    last=$(( ${#CAMP_DIRS[@]} - 1 ))
+    case "$field" in
+      cmd)
+        if test -n "${CAMP_CMDS[$last]}"; then
+          err "Two -e options for one campaign; each -e needs its own -d."
+          exit 1
+        fi
+        CAMP_CMDS[$last]="$value" ;;
+      bin)  CAMP_BINS[$last]="$value" ;;
+      name) CAMP_NAMES[$last]="$value" ;;
+    esac
+  }
 
   # ── argument parsing ───────────────────────────────────────────────────────
   if test $# -eq 0; then usage_report; exit 1; fi
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      -d)            need_arg "-d" "${2-}"; AFL_DIR="$2";       shift 2 ;;
-      -e)            need_arg "-e" "${2-}"; COVERAGE_CMD="$2";  shift 2 ;;
+      -d)            need_arg "-d" "${2-}"
+                     CAMP_DIRS+=("$2"); CAMP_CMDS+=(""); CAMP_BINS+=(""); CAMP_NAMES+=("")
+                     shift 2 ;;
+      -e)            need_arg "-e" "${2-}"; _camp_set cmd "$2";  shift 2 ;;
+      --name)        need_arg "--name" "${2-}"; _camp_set name "$2"; shift 2 ;;
       -o)            need_arg "-o" "${2-}"; REPORT_DIR="$2";    shift 2 ;;
       -t)            need_arg "-t" "${2-}"; FORKS="$2";         shift 2 ;;
       -T)            need_arg "-T" "${2-}"; TIMEOUT="$2";       shift 2 ;;
@@ -3254,27 +3863,91 @@ cmd_report() {
       --ignore-regex) need_arg "--ignore-regex" "${2-}"; IGNORE_REGEX="$2"; shift 2 ;;
       --layout)      need_arg "--layout" "${2-}"; FUZZER_LAYOUT="$2";       shift 2 ;;
       --reachability) need_arg "--reachability" "${2-}"; REACHABILITY="$2"; shift 2 ;;
-      --binary)      need_arg "--binary" "${2-}"; BINARY_OVERRIDE="$2"; shift 2 ;;
+      --binary)      need_arg "--binary" "${2-}"; _camp_set bin "$2"; shift 2 ;;
       --max-replay-failures)
                      need_arg "--max-replay-failures" "${2-}"
                      MAX_REPLAY_FAILURES="$2"; shift 2 ;;
+      --replay-only) REPLAY_ONLY=1; shift ;;
+      --remote)      need_arg "--remote" "${2-}"; REMOTE_HOST="$2"; shift 2 ;;
+      --ssh-opts)    # its value is a flag string, so need_arg cannot vet it
+                     if test $# -lt 2; then
+                       err "Option --ssh-opts requires an argument"
+                       exit 1
+                     fi
+                     SSH_OPTS="$2"; shift 2 ;;
+      --remote-dir)  need_arg "--remote-dir" "${2-}"; REMOTE_DIR="$2"; shift 2 ;;
+      --profdata)    need_arg "--profdata" "${2-}"; PROFDATA_INPUTS+=("$2"); shift 2 ;;
       --migrate-existing-report) MIGRATE_EXISTING=1; shift ;;
       *) err "Unknown option: $1"; echo "" >&2; usage_report >&2; exit 1 ;;
     esac
   done
 
+  local CAMP_COUNT="${#CAMP_DIRS[@]}"
+  if test "$CAMP_COUNT" -gt 0; then
+    AFL_DIR="${CAMP_DIRS[0]}"
+    COVERAGE_CMD="${CAMP_CMDS[0]}"
+    BINARY_OVERRIDE="${CAMP_BINS[0]}"
+  fi
+
   # ── validate inputs ────────────────────────────────────────────────────────
-  if test -z "$AFL_DIR"; then
-    err "Must specify input directory with -d (AFL++, libFuzzer, libafl, or honggfuzz)"
+  local RENDER_ONLY=0
+  test "${#PROFDATA_INPUTS[@]}" -gt 0 && RENDER_ONLY=1
+  if test "$RENDER_ONLY" -eq 1 && test "$REPLAY_ONLY" -eq 1; then
+    err "--replay-only and --profdata are mutually exclusive: one replays a corpus,"
+    err "the other renders profile data that was produced earlier."
     exit 1
   fi
-  if test -z "$COVERAGE_CMD"; then
-    err "Must specify coverage command with -e"
-    exit 1
+  if test -n "$REMOTE_HOST"; then
+    if test "$RENDER_ONLY" -eq 1; then
+      err "--remote replays a corpus; --profdata renders one that was already replayed."
+      exit 1
+    fi
+    if test "$CAMP_COUNT" -gt 1; then
+      err "--remote handles one campaign at a time."
+      exit 1
+    fi
+    if test -z "$BINARY_OVERRIDE"; then
+      err "--remote needs the LOCAL instrumented binary for rendering: pass --binary <path>."
+      err "-d and -e name paths on $REMOTE_HOST, which may differ from the local ones."
+      exit 1
+    fi
+    if test -z "$REPORT_DIR"; then
+      err "--remote cannot derive the report directory from a remote -d: pass -o <dir>."
+      exit 1
+    fi
+    require_command ssh "cov-analysis report --remote" || exit 1
+    require_command scp "cov-analysis report --remote" || exit 1
   fi
-  if ! test -d "$AFL_DIR"; then
-    err "Input directory does not exist: $AFL_DIR"
-    exit 1
+  if test "$RENDER_ONLY" -eq 1; then
+    if test -z "$COVERAGE_CMD" && test -z "$BINARY_OVERRIDE"; then
+      err "--profdata needs the instrumented binary: pass --binary <path> (or -e)."
+      exit 1
+    fi
+    if test -z "$REPORT_DIR"; then
+      err "--profdata has no input directory to derive the report directory from:"
+      err "pass -o <dir>."
+      exit 1
+    fi
+    local _pd
+    for _pd in "${PROFDATA_INPUTS[@]}"; do
+      if ! test -f "$_pd"; then
+        err "--profdata input does not exist: $_pd"
+        exit 1
+      fi
+    done
+  else
+    if test -z "$AFL_DIR"; then
+      err "Must specify input directory with -d (AFL++, libFuzzer, libafl, or honggfuzz)"
+      exit 1
+    fi
+    if test -z "$COVERAGE_CMD"; then
+      err "Must specify coverage command with -e"
+      exit 1
+    fi
+    if test -z "$REMOTE_HOST" && ! test -d "$AFL_DIR"; then
+      err "Input directory does not exist: $AFL_DIR"
+      exit 1
+    fi
   fi
   case "$FORKS" in
     ''|*[!0-9]*|0)
@@ -3321,7 +3994,9 @@ cmd_report() {
   require_coreutils_command mv "cov-analysis report" || exit 1
   require_coreutils_command realpath "cov-analysis report" || exit 1
   require_command python3 "cov-analysis report" || exit 1
-  AFL_DIR="$(resolve_input_dir "$AFL_DIR")" || exit 1
+  if test "$RENDER_ONLY" -eq 0 && test -z "$REMOTE_HOST"; then
+    AFL_DIR="$(resolve_input_dir "$AFL_DIR")" || exit 1
+  fi
   if test -n "$REACHABILITY"; then
     if ! validate_reachability "$REACHABILITY"; then
       err "Invalid reachability input: $REACHABILITY"
@@ -3333,9 +4008,11 @@ cmd_report() {
   COV_BINARY="$(resolve_coverage_binary "$COVERAGE_CMD" "$BINARY_OVERRIDE")" || exit 1
   logv "Coverage binary: $COV_BINARY"
 
-  # Forgotten @@ on a driver binary → supply it automatically (argv-only input).
-  COVERAGE_CMD="$(add_at_if_driver "$COVERAGE_CMD" "$COV_BINARY")"
-  logv "Coverage command: $COVERAGE_CMD"
+  if test "$RENDER_ONLY" -eq 0; then
+    # Forgotten @@ on a driver binary → supply it automatically (argv-only input).
+    COVERAGE_CMD="$(add_at_if_driver "$COVERAGE_CMD" "$COV_BINARY")"
+    logv "Coverage command: $COVERAGE_CMD"
+  fi
 
   test -z "$REPORT_DIR" && REPORT_DIR="$AFL_DIR/cov"
   REPORT_DIR="$(realpath -m -- "$REPORT_DIR")" || {
@@ -3380,20 +4057,45 @@ cmd_report() {
   }
   log "LLVM tools: $LLVM_PROFDATA, $LLVM_COV"
 
-  # ── detect or honor fuzzer layout ──────────────────────────────────────────
-  if test -z "$FUZZER_LAYOUT"; then
-    FUZZER_LAYOUT="$(detect_fuzzer_layout)"
-  fi
-  case "$FUZZER_LAYOUT" in
-    afl)  log "Fuzzer layout   : AFL++ (queue/crashes/timeouts)" ;;
-    flat) log "Fuzzer layout   : flat (libFuzzer/libafl/honggfuzz)" ;;
-    empty)
-      err "No input files found in $AFL_DIR"
-      err "Expected one of: AFL++ out dir, libFuzzer/libafl corpus, honggfuzz workspace."
-      err "Override detection with --layout afl|flat if needed."
+  if test "$CAMP_COUNT" -gt 1; then
+    if test "$RENDER_ONLY" -eq 1 || test "$REPLAY_ONLY" -eq 1; then
+      err "Multiple campaigns cannot be combined with --profdata or --replay-only."
       exit 1
-      ;;
-  esac
+    fi
+    run_multi_campaign || exit 1
+    return 0
+  fi
+
+  if test -n "$REMOTE_HOST"; then
+    local REMOTE_WORK REMOTE_PROFDATA
+    REMOTE_WORK="$(mktemp -d "$(tmp_base_dir)/cov-analysis-remote.XXXXXX")" || exit 1
+    COV_REPORT_CLEAN_PROFRAW="$REMOTE_WORK"
+    trap cleanup_report_work EXIT INT TERM
+    REMOTE_PROFDATA="$REMOTE_WORK/coverage.profdata"
+    log "Remote host     : $REMOTE_HOST"
+    if ! run_remote_replay "$REMOTE_HOST" "$REMOTE_PROFDATA" "$SSH_OPTS" "$REMOTE_DIR"; then
+      exit 1
+    fi
+    PROFDATA_INPUTS=("$REMOTE_PROFDATA")
+    RENDER_ONLY=1
+  fi
+
+  # ── detect or honor fuzzer layout ──────────────────────────────────────────
+  if test "$RENDER_ONLY" -eq 0; then
+    if test -z "$FUZZER_LAYOUT"; then
+      FUZZER_LAYOUT="$(detect_fuzzer_layout)"
+    fi
+    case "$FUZZER_LAYOUT" in
+      afl)  log "Fuzzer layout   : AFL++ (queue/crashes/timeouts)" ;;
+      flat) log "Fuzzer layout   : flat (libFuzzer/libafl/honggfuzz)" ;;
+      empty)
+        err "No input files found in $AFL_DIR"
+        err "Expected one of: AFL++ out dir, libFuzzer/libafl corpus, honggfuzz workspace."
+        err "Override detection with --layout afl|flat if needed."
+        exit 1
+        ;;
+    esac
+  fi
 
   # ── prepare workspace ──────────────────────────────────────────────────────
   PROFRAW_DIR="$(mktemp -d "$(tmp_base_dir)/cov-analysis-profraw.XXXXXX")"
@@ -3401,7 +4103,6 @@ cmd_report() {
   COV_REPORT_CLEAN_PROFRAW="$PROFRAW_DIR"
   COV_REPORT_CLEAN_STAGE="$STAGE_DIR"
   trap cleanup_report_work EXIT INT TERM
-  mkdir -p "$STAGE_DIR/html" "$STAGE_DIR/text"
   printf 'cov-analysis-report-v1\n' > "$STAGE_DIR/$REPORT_MARKER_NAME"
   if test -s "$REPORT_DIR/coverage.json"; then
     log "Preserving previous coverage.json as coverage_old.json"
@@ -3409,12 +4110,29 @@ cmd_report() {
   fi
   export LLVM_PROFILE_FILE="$PROFRAW_DIR/cov-%p.profraw"
 
-  log "Input directory : $AFL_DIR"
   log "Report directory: $REPORT_DIR"
-  log "Replay workers : $FORKS"
+  if test "$RENDER_ONLY" -eq 1; then
+    log "Profile inputs  : ${#PROFDATA_INPUTS[@]}"
+  else
+    log "Input directory : $AFL_DIR"
+    log "Replay workers : $FORKS"
+  fi
   logv "Profraw temp dir: $PROFRAW_DIR"
 
+  # ── render-only: merge the supplied profiles and skip replay ───────────────
+  if test "$RENDER_ONLY" -eq 1; then
+    local PD_MANIFEST="$PROFRAW_DIR/profdata.manifest"
+    printf '%s\n' "${PROFDATA_INPUTS[@]}" > "$PD_MANIFEST"
+    log "Merging ${#PROFDATA_INPUTS[@]} profile(s)..."
+    merge_profiles "$LLVM_PROFDATA" "$PROFRAW_DIR" "$STAGE_DIR/coverage.profdata" \
+      "" "$PD_MANIFEST" || {
+      err "llvm-profdata merge failed"
+      exit 1
+    }
+  fi
+
   # ── replay queue files ─────────────────────────────────────────────────────
+  if test "$RENDER_ONLY" -eq 0; then
   local QUEUE_COUNT
   QUEUE_COUNT=$(count_files find_queue_files)
   log "Replaying $QUEUE_COUNT queue files..."
@@ -3528,111 +4246,30 @@ cmd_report() {
     err "llvm-profdata merge failed"
     exit 1
   }
+  fi
+
+  # ── replay-only: publish just the merged profile ───────────────────────────
+  if test "$REPLAY_ONLY" -eq 1; then
+    if ! validate_staged_profdata "$STAGE_DIR"; then
+      err "The staged profile is incomplete; the previous report was preserved."
+      exit 1
+    fi
+    if ! publish_report "$STAGE_DIR" "$REPORT_DIR"; then
+      exit 1
+    fi
+    STAGE_DIR=""
+    COV_REPORT_CLEAN_STAGE=""
+    if test "$QUIET" -eq 0; then
+      echo ""
+      echo "[+] Profile data : $REPORT_DIR/coverage.profdata"
+      echo "[+] Render it with: cov-analysis report --profdata $REPORT_DIR/coverage.profdata --binary <binary> -o <dir>"
+    fi
+    return 0
+  fi
 
   # ── generate reports ───────────────────────────────────────────────────────
-  local SHOW_OPTS=(
-    "$COV_BINARY"
-    "-instr-profile=$STAGE_DIR/coverage.profdata"
-    "-show-directory-coverage"
-    "-show-line-counts-or-regions"
-    "-show-branches=count"
-    "-ignore-filename-regex=$IGNORE_REGEX"
-  )
-
-  # With --reachability the HTML index is rewritten with reachable-only numbers,
-  # which needs the flat single-table index — so drop -show-directory-coverage
-  # (its hierarchical multi-index layout) for the HTML output in that case.
-  local HTML_SHOW_OPTS=("${SHOW_OPTS[@]}")
-  if test -n "$REACHABILITY"; then
-    local _o; local -a _filtered=()
-    for _o in "${HTML_SHOW_OPTS[@]}"; do
-      test "$_o" = "-show-directory-coverage" && continue
-      _filtered+=("$_o")
-    done
-    HTML_SHOW_OPTS=("${_filtered[@]}")
-  fi
-
-  log "Generating HTML report..."
-  "$LLVM_COV" show "${HTML_SHOW_OPTS[@]}" \
-    -format=html \
-    -output-dir="$STAGE_DIR/html" || {
-    err "llvm-cov show (HTML) failed"
-    exit 1
-  }
-
-  log "Generating text report..."
-  "$LLVM_COV" show "${SHOW_OPTS[@]}" \
-    -format=text \
-    -use-color=false \
-    -output-dir="$STAGE_DIR/text" || {
-    err "llvm-cov show (text) failed"
-    exit 1
-  }
-
-  log "Generating summary..."
-  "$LLVM_COV" report "$COV_BINARY" \
-    "-instr-profile=$STAGE_DIR/coverage.profdata" \
-    "-ignore-filename-regex=$IGNORE_REGEX" \
-    > "$STAGE_DIR/summary.txt" || {
-    err "llvm-cov report failed"
-    exit 1
-  }
-
-  log "Generating JSON export..."
-  # llvm-cov quirk: --format=text emits JSON; --format=lcov emits LCOV.
-  "$LLVM_COV" export "$COV_BINARY" \
-    --format=text \
-    "-instr-profile=$STAGE_DIR/coverage.profdata" \
-    "-ignore-filename-regex=$IGNORE_REGEX" \
-    > "$STAGE_DIR/coverage.json" || {
-    err "llvm-cov export failed"
-    exit 1
-  }
-
-  # ── per-function metrics ───────────────────────────────────────────────────
-  # They feed the gap inventory, and let the reachability annotator recompute
-  # Function/Line/Region/Branch coverage excluding unreachable functions.
-  local PERFUNC="$PROFRAW_DIR/perfunc.txt"
-  local SRC_RESPONSE="$PROFRAW_DIR/sources.rsp"
-  : > "$PERFUNC"
-  if write_source_response "$STAGE_DIR/coverage.json" "$SRC_RESPONSE" 2>/dev/null; then
-    if ! "$LLVM_COV" report "$COV_BINARY" \
-      "-instr-profile=$STAGE_DIR/coverage.profdata" \
-      "-ignore-filename-regex=$IGNORE_REGEX" \
-      -show-functions "@$SRC_RESPONSE" > "$PERFUNC"; then
-      err "llvm-cov per-function report failed."
-      exit 1
-    fi
-    if ! test -s "$PERFUNC"; then
-      err "llvm-cov per-function report was empty."
-      exit 1
-    fi
-  elif test -n "$REACHABILITY"; then
-    err "Could not build the source response file for reachable-only metrics."
-    exit 1
-  else
-    logv "Coverage export lists no source files; the gap inventory will be empty."
-  fi
-
-  # ── reachability annotation (optional) ─────────────────────────────────────
-  local VERDICTS=""
-  if test -n "$REACHABILITY"; then
-    log "Annotating reports with reachability..."
-    VERDICTS="$PROFRAW_DIR/verdicts.tsv"
-    local REACH_TALLY=""
-    if ! REACH_TALLY="$(annotate_reachability "$STAGE_DIR/coverage.json" "$REACHABILITY" \
-         "$STAGE_DIR/html" "$STAGE_DIR/text" "$STAGE_DIR/summary.txt" "$PERFUNC" \
-         "$VERDICTS")"; then
-      err "Reachability annotation failed."
-      exit 1
-    fi
-    log "Reachability: $REACH_TALLY"
-  fi
-
-  # ── gap inventory ──────────────────────────────────────────────────────────
-  log "Building gap inventory..."
-  if ! write_gap_inventory "$PERFUNC" "$STAGE_DIR/gaps.txt" "$VERDICTS"; then
-    err "Could not build the gap inventory."
+  if ! render_coverage_report "$LLVM_COV" "$STAGE_DIR" "$STAGE_DIR/coverage.profdata" \
+       "$IGNORE_REGEX" "$REACHABILITY" "$PROFRAW_DIR" "$COV_BINARY"; then
     exit 1
   fi
 

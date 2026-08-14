@@ -12,6 +12,8 @@ Version: 1.2-dev
 - [Workflow](#workflow)
   - [Step 1: Build a Coverage Binary](#step-1-build-a-coverage-binary)
   - [Step 2: Generate Coverage Report](#step-2-generate-coverage-report)
+    - [Multiple harnesses in one run](#multiple-harnesses-in-one-run)
+    - [Replaying where the corpus lives](#replaying-where-the-corpus-lives)
   - [Step 3: Diff Two Coverage Reports](#step-3-diff-two-coverage-reports)
   - [Step 4: Identifying unstable code lines](#step-4-identifying-unstable-code-lines)
   - [Step 5: Search which inputs reach a line](#step-5-search-which-inputs-reach-a-line)
@@ -315,6 +317,68 @@ metrics are present.
 "still uncovered functions" list in the diff report into reachable (amber,
 actionable) and unreachable (grey, expected dead).
 
+#### Multiple harnesses in one run
+
+A project with more than one harness needs per-harness numbers, the union, and
+a way to see which harness covers what. Repeat `-d`/`-e` and `cov-analysis`
+produces all three in one command:
+
+```bash
+cov-analysis -d out-parser  -e "./cov-parser @@"  --name parser \
+             -d out-decoder -e "./cov-decoder @@" --name decoder \
+             -o coverage
+```
+
+Each `-d` starts a campaign; `-e`, `--binary` and `--name` attach to the
+campaign started by the most recent `-d`. A single `-d`/`-e` pair behaves
+exactly as before. With two or more, the output directory holds:
+
+```
+coverage/
+  parser/       ← full report for that campaign, gaps.txt included
+  decoder/
+  union/        ← full report over every campaign, every binary as its own object
+  attribution.txt   ← per file: lines each campaign covered, and lines only it reached
+  attribution.html
+```
+
+The attribution table answers "which harness covers this file best" and, more
+usefully, "which lines would I lose if I dropped this harness" — a file whose
+lines are all unique to one campaign is covered by that harness alone.
+
+If the campaign binaries were built from different sources, `cov-analysis` says
+so: llvm-cov keeps one coverage mapping per function and silently drops the
+ones that differ, so the union would under-report without the warning.
+
+#### Replaying where the corpus lives
+
+Carrying a 32k-file corpus across the network to replay it locally is the slow
+way round. `--replay-only` stops after the merged profile, and `--profdata`
+renders from one:
+
+```bash
+# on the fuzzing box
+cov-analysis -d out -e "./cov @@" -o profile --replay-only
+# back on your machine, after copying profile/coverage.profdata
+cov-analysis --profdata coverage.profdata --binary ./cov -o coverage
+```
+
+`--remote` does both halves in one command, copying `cov-analysis` to the host
+itself so nothing needs to be installed there:
+
+```bash
+cov-analysis --remote fuzzbox -d /fuzz/out -e "/fuzz/cov @@" \
+  --binary ./cov -o coverage
+```
+
+`-d` and `-e` are paths on the remote host; `--binary` is the matching local
+binary used for rendering, and `-o` is required. Only `coverage.profdata` comes
+back — never the corpus. The remote working directory is removed on success and
+on failure. Pass ssh/scp options with `--ssh-opts "-o Port=2222"`.
+
+`--profdata` is also how you re-render an existing report with a different
+`--ignore-regex` or fresh `--reachability` data, without replaying anything.
+
 ### Step 3: Diff Two Coverage Reports
 
 Compare coverage between two `llvm-cov` JSON exports and generate an HTML diff report:
@@ -485,6 +549,15 @@ Optional:
                      purple=covered yet flagged unreachable; text gets a U/R/A
                      marker column and summary.txt a reachability tally.
                      Any reachability/recompute failure makes report fail.
+  --replay-only      Replay and merge, write coverage.profdata into <-o>, and
+                     stop without rendering a report
+  --profdata <file>  Render from existing profile data instead of replaying a
+                     corpus; repeatable, several profiles merge into one report
+  --name <name>      Directory name for the campaign started by the last -d
+  --remote <host>    Replay on [user@]host and fetch only the merged profile;
+                     -d/-e are remote paths, --binary is the local binary
+  --ssh-opts <opts>  Options for ssh and scp, e.g. "-o Port=2222"
+  --remote-dir <dir> Remote working directory (default: remote mktemp -d)
   --migrate-existing-report
                      Explicitly replace a complete pre-marker report after a
                      successful staged run; arbitrary directories are refused
