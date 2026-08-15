@@ -4,7 +4,7 @@
 
 Replacing `afl-cov` and `libfuzzer-cov` with modern coverage gathering and great features!
 
-Version: 1.2-dev
+Version: 1.2
 
 - [Introduction](#introduction)
 - [Prerequisites](#prerequisites)
@@ -70,6 +70,15 @@ The coverage reports can be augmented with harness reachability information from
 Only regular files are selected. Directories and symlinks are never counted or
 replayed. For libFuzzer, libafl and honggfuzz, crash-like files are replayed
 under the `-T` hard deadline so a hanging input cannot stall the run.
+
+Queue and corpus inputs have their own deadline, `--queue-timeout`. Its default
+is derived from the campaign: the largest `slowest_exec_ms` across the AFL++
+`fuzzer_stats` files, rounded up to a whole second and multiplied by 5 (at
+least 5s), because the coverage binary has no forkserver, runs `-O1` with
+counters and writes a profile per exec. A layout that carries no `fuzzer_stats`
+gets 60s. Inputs that hit the deadline are listed in `<-o>/slow_inputs.txt`:
+a corpus entry that does not terminate under coverage instrumentation is a
+finding in its own right.
 
 Inputs are always handed to the target as absolute paths, so a harness that
 changes its working directory (a sandbox `chdir()`, for example) still finds
@@ -168,6 +177,7 @@ Output:
   gaps.txt            ← uncovered code ranked by ABSOLUTE uncovered regions
   coverage.json       ← machine-readable export
   coverage.profdata   ← merged profile (baseline for iterative improvement)
+  slow_inputs.txt     ← only when inputs hit the replay deadline: which ones
 ```
 
 `gaps.txt` answers "where is the most uncovered code" without post-processing.
@@ -379,6 +389,32 @@ on failure. Pass ssh/scp options with `--ssh-opts "-o Port=2222"`.
 `--profdata` is also how you re-render an existing report with a different
 `--ignore-regex` or fresh `--reachability` data, without replaying anything.
 
+`--remote` is also immune to version skew: it copies the local script to the
+host, so both halves of the run are the same build. For two installations you
+compare by hand, `-V` prints the content hash and path of the copy that ran —
+two checkouts months apart carry the same version string, and the hash is what
+tells them apart.
+
+#### One run at a time per report directory
+
+A run locks its output directory for as long as it holds it. A second run
+against the same `-o` is refused, naming the pid of the one that has it; pass
+`--force` to take the directory over. The lock and the staging directory live
+beside the report as `.<name>.cov-analysis.lock` and
+`.<name>.cov-analysis.stage.*` — beside it, because publication is an atomic
+rename and a rename cannot cross filesystems.
+
+A killed run leaves its staging directory behind. `--clean` removes the lock
+and staging directories that no running `cov-analysis` holds:
+
+```bash
+cov-analysis report -o coverage --clean
+```
+
+It refuses while a live run holds the directory, and it never deletes a
+`.cov-analysis.rollback.*` directory: that one holds the previous report of a
+run that died while publishing.
+
 ### Step 3: Diff Two Coverage Reports
 
 Compare coverage between two `llvm-cov` JSON exports and generate an HTML diff report:
@@ -530,6 +566,15 @@ Optional:
   -o <dir>           Report output directory (default: <afl-dir>/cov)
   -t <num>           Parallel replay workers/forks (default: 1)
   -T <secs>          Timeout for crash/timeout replay (default: 5)
+  --queue-timeout <secs>
+                     Per-input timeout for queue/corpus replay. Default: derived
+                     from the largest slowest_exec_ms in the AFL++ fuzzer_stats
+                     files (rounded up to a second, x5, minimum 5s), or 60s when
+                     there is none. 0 disables it. Inputs that hit it are listed
+                     in <-o>/slow_inputs.txt
+  --force            Take over a report directory another run holds
+  --clean            Remove the lock and staging directories of <-o> that no
+                     running cov-analysis holds, then exit
   --binary <path>    Instrumented binary for LLVM and driver detection;
                      required when -e has quoted paths, wrappers, or shell syntax
   --layout <kind>    Force layout: 'afl' or 'flat' (default: auto-detect)

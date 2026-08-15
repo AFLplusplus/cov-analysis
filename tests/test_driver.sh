@@ -99,7 +99,49 @@ assert_eq "$rc" "0" "an empty input must not fail the driver: $out"
 printf '%s\n' "$out" | grep -q 'empty input' \
   || die "driver did not report the empty input: $out"
 
-out=$("$TMP/cov" --printsignature 2>&1)
+# A batch is one process, so an outer timeout can only kill the whole batch.
+# The driver's own per-input alarm must name the input that hung, carry on with
+# the rest of the batch, and leave the exit status alone.
+cat > "$TMP/harness_hang.c" <<'EOF'
+#include <stddef.h>
+#include <unistd.h>
+static volatile int sink;
+int LLVMFuzzerTestOneInput(const unsigned char *data, size_t size) {
+  if (size > 0 && data[0] == 'H') { for (;;) sleep(1); }
+  sink += (int)size;
+  return 0;
+}
+EOF
+"$CLANG" -fprofile-instr-generate -fcoverage-mapping "$DRIVER" "$TMP/harness_hang.c" \
+  -o "$TMP/cov3" || die "hanging harness compilation failed"
+printf a > "$TMP/in1"
+printf H > "$TMP/in2"
+printf c > "$TMP/in3"
+: > "$TMP/slow.txt"
+out=$(COV_INPUT_TIMEOUT=1 COV_TIMEOUT_LOG="$TMP/slow.txt" \
+  LLVM_PROFILE_FILE="$TMP/hang.profraw" timeout 60 "$TMP/cov3" \
+  "$TMP/in1" "$TMP/in2" "$TMP/in3" 2>&1)
+rc=$?
+assert_eq "$rc" "0" "a timed-out input must not change the driver's exit status: $out"
+printf '%s\n' "$out" | grep -q "timeout after 1s: $TMP/in2" \
+  || die "the driver did not name the input that hung: $out"
+n=$(printf '%s\n' "$out" | grep -c '^Running: ')
+assert_eq "$n" "3" "the driver must carry on with the rest of the batch: $out"
+assert_eq "$(cat "$TMP/slow.txt")" "$TMP/in2" "the driver did not log the input that hung"
+test -s "$TMP/hang.profraw" || die "a batch with a timed-out input wrote no profile"
+"$PROFDATA" merge -sparse "$TMP/hang.profraw" -o "$TMP/hang.profdata" \
+  || die "the profile written after a per-input timeout is invalid"
+echo "[PASS] per-input deadline inside a batch"
+
+# Without COV_INPUT_TIMEOUT nothing is armed and no alarm interferes.
+out=$(LLVM_PROFILE_FILE="$TMP/noalarm.profraw" "$TMP/cov3" "$TMP/in1" "$TMP/in3" 2>&1)
+assert_eq "$?" "0" "the driver must run unbounded without COV_INPUT_TIMEOUT: $out"
+printf '%s\n' "$out" | grep -q '0 timed out' \
+  || die "an unbounded run must report no timeouts: $out"
+
+# LLVM_PROFILE_FILE keeps the profiling runtime from dropping a default.profraw
+# into the repository at exit.
+out=$(LLVM_PROFILE_FILE="$TMP/sig.profraw" "$TMP/cov" --printsignature 2>&1)
 rc=$?
 assert_eq "$rc" "0" "--printsignature must exit 0 so driver detection keeps working: $out"
 printf '%s\n' "$out" | grep -q 'SIGNATURE_LLVMFUZZERTESTONEINPUT_COVERAGE' \

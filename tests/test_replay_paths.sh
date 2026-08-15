@@ -85,7 +85,7 @@ fi
 
 printf '%s\n' "$out" | grep -q 'Queue replay *: 3 ok, 0 failed, 0 timed out' \
   || die "queue replay outcome was not reported: $out"
-printf '%s\n' "$out" | grep -q 'Crash replay *: 1 ok, 0 failed, 0 timed out' \
+printf '%s\n' "$out" | grep -q 'Crash replay *: 1 exited cleanly, 0 reproduced' \
   || die "crash replay outcome was not reported: $out"
 echo "[PASS] absolute input paths and replay accounting"
 
@@ -95,9 +95,13 @@ rm -rf "$TMP/rep"
 out=$(FAIL_MATCH="sig:11,src:000" report_relative)
 rc=$?
 assert_eq "$rc" "0" "crash replay failures must not fail the run: $out"
-printf '%s\n' "$out" | grep -q 'Crash replay *: 0 ok, 1 failed, 0 timed out' \
-  || die "crash replay failure was not counted: $out"
-echo "[PASS] crash replay failures are tolerated"
+printf '%s\n' "$out" | grep -q 'Crash replay *: 0 exited cleanly, 1 reproduced (non-zero exit, expected), 0 timed out' \
+  || die "crash replay outcome was not counted: $out"
+# A crash input that dies is the desired outcome. Calling it "failed" reads as
+# a broken tool.
+printf '%s\n' "$out" | grep -q 'Crash replay.*failed' \
+  && die "the crash replay line must not call an expected crash a failure: $out"
+echo "[PASS] crash replay outcomes are named as expected, not as failures"
 
 # Every queue input failing means the measurement is wrong, not the target.
 : > "$FAILLOG"

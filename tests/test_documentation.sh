@@ -57,7 +57,7 @@ check_command diff cmd_diff
 
 # Report artifacts the tool publishes must be described in the README.
 for artifact in summary.txt gaps.txt coverage.json coverage.profdata \
-                attribution.txt; do
+                attribution.txt slow_inputs.txt; do
   grep -q "$artifact" "$README" \
     || die "published artifact $artifact is not described in README.md"
 done
