@@ -4,7 +4,7 @@
 
 Replacing `afl-cov` and `libfuzzer-cov` with modern coverage gathering and great features!
 
-Version: 1.2
+Version: 1.3-dev
 
 - [Introduction](#introduction)
 - [Prerequisites](#prerequisites)

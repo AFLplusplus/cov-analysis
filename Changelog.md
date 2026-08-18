@@ -1,3 +1,7 @@
+# v1.3-dev
+- added --batch for better performance
+- more performance fixes
+
 # v1.2
 - multi-campaign: repeat `-d`/`-e` (with `--name`, `--binary`) to get a report per harness, a union report over all of them, and `attribution.txt`/`.html` showing which lines only one campaign reaches; mismatched campaign binaries are reported instead of silently under-reporting
 - split replay from rendering: `--replay-only` publishes just `coverage.profdata`, `--profdata <file>` (repeatable) renders from profiles produced earlier
