@@ -100,6 +100,7 @@ require_replay_commands() {
 QUEUE_TIMEOUT_FACTOR=5
 QUEUE_TIMEOUT_MIN=5
 QUEUE_TIMEOUT_FALLBACK=60
+BATCH_SIZE_DEFAULT=128
 
 # Print "<max slowest_exec_ms> <instances>" over every fuzzer_stats an AFL++
 # output directory holds (one per parallel instance). exec_timeout stands in
@@ -148,21 +149,12 @@ derive_queue_timeout() {
 }
 
 run_with_timeout() {
-  local seconds="$1" pidfile rc pgid=""
+  local seconds="$1" rc=0 pid
   shift
-  pidfile="$(mktemp "${TMPDIR:-/tmp}/cov-analysis-timeout.XXXXXX")" || return 1
-  if timeout --signal=TERM --kill-after=1s "${seconds}s" \
-    bash -c 'pgid="$BASHPID"; read -r _ _ _ _ pgid _ < "/proc/$BASHPID/stat" 2>/dev/null || true; printf "%s\n" "$pgid" > "$1"; shift; exec "$@"' \
-    _ "$pidfile" "$@"; then
-    rc=0
-  else
-    rc=$?
-  fi
-  test -s "$pidfile" && read -r pgid < "$pidfile"
-  if test -n "$pgid"; then
-    kill -KILL -- "-$pgid" 2>/dev/null || true
-  fi
-  rm -f -- "$pidfile"
+  timeout --signal=TERM --kill-after=1s "${seconds}s" "$@" <&0 &
+  pid=$!
+  wait "$pid" || rc=$?
+  kill -KILL -- "-$pid" 2>/dev/null || true
   return "$rc"
 }
 
@@ -868,6 +860,24 @@ add_at_if_driver() {
   fi
 }
 
+resolve_batch_size() {
+  local cmd="$1" is_driver="$2" requested="${3:-}" last
+  last="${cmd##* }"
+  if test "$last" != "@@"; then
+    printf '0\n'
+    return 0
+  fi
+  if test -n "$requested"; then
+    if test "$requested" -le 1; then printf '0\n'; else printf '%d\n' "$requested"; fi
+    return 0
+  fi
+  if test "$is_driver" -eq 1; then
+    printf '%d\n' "$BATCH_SIZE_DEFAULT"
+  else
+    printf '0\n'
+  fi
+}
+
 # Classify $AFL_DIR as one of:
 #   afl    — AFL++ layout: a queue/crashes/timeouts directory exists
 #   flat   — libFuzzer/libafl/honggfuzz flat corpus or crash dir (≥1 regular file)
@@ -1261,6 +1271,21 @@ Optional:
                      0 disables the deadline (a corpus that holds one input which
                      does not terminate then pins a worker forever). Inputs that
                      hit it are listed in <-o>/slow_inputs.txt.
+  --batch <num>      Replay <num> queue inputs per process instead of one.
+                     The per-input cost of replay is a fork, an exec and a full
+                     profile write sized by the binary's counter count, not by
+                     the input; batching amortises all three and is what makes a
+                     corpus of several hundred thousand entries finish. Requires
+                     a coverage command ending in @@ (the file list is appended
+                     to it) and a target that accepts several input files on
+                     argv — a cov-analysis driver, a libFuzzer binary, or a
+                     hand-written argv loop. Default: 128 for a cov-analysis
+                     driver binary, otherwise one input per process. 0 or 1
+                     forces one input per process. Above ~128 there is nothing
+                     measurable left to win. On a binary that is not a
+                     cov-analysis driver there is no per-input alarm, so one
+                     input that does not terminate costs its whole batch the
+                     coverage at the deadline; --batch 0 isolates it.
   --force            Take over a report directory another run holds.
   --clean            Remove the lock and staging directories of <-o> that no
                      running cov-analysis holds, then exit. A staging directory
@@ -1345,17 +1370,22 @@ Examples:
   # A corpus with slow entries: bound each queue input explicitly
   cov-analysis -d out -e "./cov @@" --queue-timeout 30
 
-  # Do NOT wrap the target in `timeout -s KILL` to bound it yourself. For a
-  # driver binary a trailing @@ replays 128 inputs per process, so SIGKILL
-  # throws away the unwritten profile of every input in that batch, and a
-  # wrapper in -e also forces --binary. Use --queue-timeout; if you must wrap,
-  # wrap as `timeout -k 5 15` so the driver still flushes its profile on TERM.
+  # Do NOT wrap the target in `timeout -s KILL` to bound it yourself. Batch
+  # replay puts many inputs in one process, so SIGKILL throws away the unwritten
+  # profile of every input in that batch, and a wrapper in -e also forces
+  # --binary. Use --queue-timeout; if you must wrap, wrap as `timeout -k 5 15`
+  # so the driver still flushes its profile on TERM.
 
   # Clear what a killed run left behind, then re-run
   cov-analysis -d out -o coverage --clean
 
   # Replay coverage with 8 parallel workers
   cov-analysis -d out -e "./cov @@" -t 8
+
+  # A large corpus through a libFuzzer binary: batch it, or pay a fork, an exec
+  # and a full profile write per input (only a cov-analysis driver batches
+  # by itself)
+  cov-analysis -d out -e "./fuzzer @@" --binary ./fuzzer --batch 128 -t 8
 
   # Several harnesses over one library: per-harness, union, and attribution
   cov-analysis -d out-parser -e "./cov-parser @@" --name parser \
@@ -3805,6 +3835,7 @@ run_remote_replay() {
   remote_cmd="$remote_cmd -o $(printf '%q' "$rd/out")"
   remote_cmd="$remote_cmd --replay-only -t $FORKS -T $TIMEOUT"
   remote_cmd="$remote_cmd --max-replay-failures $MAX_REPLAY_FAILURES"
+  test -n "$BATCH_SIZE" && remote_cmd="$remote_cmd --batch $BATCH_SIZE"
   # Unset, the deadline is derived on the host, from the corpus that lives there.
   test -n "$QUEUE_TIMEOUT" && remote_cmd="$remote_cmd --queue-timeout $QUEUE_TIMEOUT"
   test -n "$FUZZER_LAYOUT" && remote_cmd="$remote_cmd --layout $FUZZER_LAYOUT"
@@ -4053,6 +4084,7 @@ run_multi_campaign() {
                    --max-replay-failures "$MAX_REPLAY_FAILURES")
     # Left unset, each campaign derives its own deadline from its own corpus.
     test -n "$QUEUE_TIMEOUT" && argv+=(--queue-timeout "$QUEUE_TIMEOUT")
+    test -n "$BATCH_SIZE" && argv+=(--batch "$BATCH_SIZE")
     test -n "${CAMP_BINS[$i]}" && argv+=(--binary "${CAMP_BINS[$i]}")
     test -n "$REACHABILITY" && argv+=(--reachability "$REACHABILITY")
     test -n "$FUZZER_LAYOUT" && argv+=(--layout "$FUZZER_LAYOUT")
@@ -4185,6 +4217,7 @@ cmd_report() {
   local MIGRATE_EXISTING=0
   local STAGE_DIR=""
   local MAX_REPLAY_FAILURES=99
+  local BATCH_SIZE=""
   local REPLAY_ONLY=0
   local REMOTE_HOST=""
   local SSH_OPTS=""
@@ -4242,6 +4275,7 @@ cmd_report() {
       --max-replay-failures)
                      need_arg "--max-replay-failures" "${2-}"
                      MAX_REPLAY_FAILURES="$2"; shift 2 ;;
+      --batch)       need_arg "--batch" "${2-}"; BATCH_SIZE="$2"; shift 2 ;;
       --replay-only) REPLAY_ONLY=1; shift ;;
       --remote)      need_arg "--remote" "${2-}"; REMOTE_HOST="$2"; shift 2 ;;
       --ssh-opts)    # its value is a flag string, so need_arg cannot vet it
@@ -4360,6 +4394,14 @@ cmd_report() {
         ;;
     esac
   fi
+  if test -n "$BATCH_SIZE"; then
+    case "$BATCH_SIZE" in
+      *[!0-9]*|'')
+        err "--batch must be a non-negative integer (0 or 1 = one input per process): $BATCH_SIZE"
+        exit 1
+        ;;
+    esac
+  fi
   case "$MAX_REPLAY_FAILURES" in
     ''|*[!0-9]*)
       err "--max-replay-failures must be a percentage between 0 and 100: $MAX_REPLAY_FAILURES"
@@ -4411,6 +4453,12 @@ cmd_report() {
     # Forgotten @@ on a driver binary → supply it automatically (argv-only input).
     COVERAGE_CMD="$(add_at_if_driver "$COVERAGE_CMD" "$COV_BINARY")"
     logv "Coverage command: $COVERAGE_CMD"
+    if test -n "$BATCH_SIZE" && test "$BATCH_SIZE" -gt 1 &&
+       test "${COVERAGE_CMD##* }" != "@@"; then
+      err "--batch $BATCH_SIZE needs a coverage command ending in @@: the input"
+      err "files are appended to it. Got: $COVERAGE_CMD"
+      exit 1
+    fi
   fi
 
   test -z "$REPORT_DIR" && REPORT_DIR="$AFL_DIR/cov"
@@ -4571,33 +4619,40 @@ cmd_report() {
   export COV_TIMEOUT_LOG="$SLOW_LOG"
   export COV_INPUT_TIMEOUT="$QUEUE_TIMEOUT"
 
+  local BATCH_N
+  BATCH_N="$(resolve_batch_size "$COVERAGE_CMD" "$IS_DRIVER" "$BATCH_SIZE")"
+  if test "$BATCH_N" -gt 0 && test "$IS_DRIVER" -ne 1; then
+    logw "Batching $BATCH_N inputs per process on a binary that is not a"
+    logw "cov-analysis driver: it has no per-input alarm, so one input that does"
+    logw "not terminate costs the whole batch its coverage at the deadline."
+  elif test "$BATCH_N" -eq 0 && test -z "$BATCH_SIZE" &&
+       test "${COVERAGE_CMD##* }" = "@@"; then
+    logw "Replaying one input per process: $COV_BINARY carries no cov-analysis"
+    logw "driver signature. If it takes several input files on argv, --batch $BATCH_SIZE_DEFAULT"
+    logw "replays that many per process and is far faster on a large corpus."
+  fi
+
   case "$COVERAGE_CMD" in
     *@@*)
-      # Determine if @@ is the last token (enables fast batch mode)
-      local LAST_TOKEN="${COVERAGE_CMD##* }"
-      if test "$LAST_TOKEN" = "@@"; then
-        if test "$IS_DRIVER" -ne 1; then
-          LAST_TOKEN="x"
-        fi
-      fi
-      if test "$LAST_TOKEN" = "@@"; then
+      if test "$BATCH_N" -gt 0; then
         # Fast batch: strip trailing @@ and let xargs append all files at once.
         # bash -c handles the same shell language as every other replay mode.
         # Each batch profiles under its own prefix (so a reused PID cannot make
         # one batch overwrite another's profile) and reports its exit status
         # and size for the replay tally.
         local CMD_NO_AT="${COVERAGE_CMD% @@}"
-        logv "Queue replay: batch (xargs, workers=$FORKS)"
+        logv "Queue replay: batch of $BATCH_N (xargs, workers=$FORKS)"
         export COV_PROFRAW_DIR="$PROFRAW_DIR" COV_CMD="$CMD_NO_AT" \
                COV_QUEUE_TIMEOUT="$QUEUE_TIMEOUT"
         export -f run_with_timeout replay_batch
         # shellcheck disable=SC2016
-        QUEUE_STATS="$(find_queue_files | xargs -0 -r -n 128 -P "$FORKS" \
+        QUEUE_STATS="$(find_queue_files | xargs -0 -r -n "$BATCH_N" -P "$FORKS" \
           bash -c 'replay_batch "$COV_CMD" "$COV_QUEUE_TIMEOUT" "$COV_PROFRAW_DIR" "$@"' -- \
           | replay_tally "$IS_DRIVER" "$QUEUE_COUNT" "queue files" || true)"
       else
-        # @@ is embedded mid-command (e.g. "./cov -f @@ -extra") — loop mode.
-        logv "Queue replay: loop (mid-command @@, workers=$FORKS)"
+        # One input per process: @@ is embedded mid-command (e.g.
+        # "./cov -f @@ -extra"), or batching was not selected for this binary.
+        logv "Queue replay: loop (workers=$FORKS)"
         export -f run_with_timeout command_for_input run_input_command \
           run_input_command_unbounded record_slow_input replay_one_input
         QUEUE_STATS="$(find_queue_files | number_inputs | xargs -0 -r -n 1 -P "$FORKS" \

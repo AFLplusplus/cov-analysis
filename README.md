@@ -158,7 +158,7 @@ cov-analysis -d /path/to/afl-fuzz-output/ -e "./cov @@" -t 8
 ```
 
 `cov-analysis` will for AFL++:
-1. Replay all `queue/id:*` files in batch (fast)
+1. Replay all `queue/id:*` files, in batch when the binary allows it (see `--batch`)
 2. Replay `crashes/id:*` and `timeouts/id:*` one-by-one with a timeout
 3. Merge `.profraw` profiles with `llvm-profdata`
 4. Generate reports in `/path/to/afl-fuzz-output/cov/`
@@ -230,10 +230,23 @@ therefore accept the same shell language.
 cov-analysis -d /path/to/libfuzzer-corpus/ -e "./cov @@"
 ```
 
-Corpus files are replayed in batch mode when the selected binary carries the
-cov-analysis driver signature; other targets use the one-input loop. If your
-libFuzzer run used `-artifact_prefix=./crashes/`, point a second run at that
-directory to cover crash inputs too — or move artifacts into the corpus dir
+Corpus files are replayed in batch mode automatically when the selected binary
+carries the cov-analysis driver signature. A libFuzzer binary carries no such
+signature, so it defaults to one process per input — but it does take several
+input files on argv, so `--batch 128` applies the same amortisation and is worth
+it on any corpus large enough to notice:
+
+```bash
+cov-analysis -d /path/to/libfuzzer-corpus/ -e "./fuzzer @@" --binary ./fuzzer \
+             --batch 128
+```
+
+Because a libFuzzer binary has no per-input alarm, an input that does not
+terminate costs its whole batch the coverage when the deadline kills it. Re-run
+with `--batch 0` to isolate one, guided by `<-o>/slow_inputs.txt`.
+
+If your libFuzzer run used `-artifact_prefix=./crashes/`, point a second run at
+that directory to cover crash inputs too — or move artifacts into the corpus dir
 beforehand.
 
 #### honggfuzz workspace
@@ -572,6 +585,12 @@ Optional:
                      files (rounded up to a second, x5, minimum 5s), or 60s when
                      there is none. 0 disables it. Inputs that hit it are listed
                      in <-o>/slow_inputs.txt
+  --batch <num>      Replay <num> queue inputs per process instead of one, which
+                     amortises the fork, the exec and the profile write each
+                     input otherwise pays for. Needs a coverage command ending
+                     in @@ and a target that takes several input files on argv.
+                     Default: 128 for a cov-analysis driver binary, one input
+                     per process otherwise; 0 or 1 forces one per process
   --force            Take over a report directory another run holds
   --clean            Remove the lock and staging directories of <-o> that no
                      running cov-analysis holds, then exit
