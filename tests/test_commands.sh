@@ -59,7 +59,7 @@ echo "[PASS] build"
 # ── AFL fixture ──────────────────────────────────────────────────────────────
 # queue: FAILS (reaches the Data[1]=='A' branch, no crash), hello (no F branch)
 # crashes: FA$$$ (reaches and crashes at the *foo=1 line)
-AFL="$TMP/out"; mkdir -p "$AFL/queue" "$AFL/crashes" "$AFL/timeouts"
+AFL="$TMP/out"; mkdir -p "$AFL/queue" "$AFL/crashes" "$AFL/hangs"
 printf 'FAILS' > "$AFL/queue/id:000000,time:0,src:000"      # F,A,I -> reaches line 12, not 15
 printf 'hello' > "$AFL/queue/id:000001,time:0,src:000"      # no 'F' -> does not reach line 12
 printf 'FA$$$' > "$AFL/crashes/id:000000,sig:11,src:000"    # F,A,$,$,$ -> crashes at line 15

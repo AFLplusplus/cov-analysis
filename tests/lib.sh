@@ -22,11 +22,11 @@ assert_count() {
 # Single-instance AFL++ layout: <dir>/{queue,crashes,timeouts}/id:*
 mkfixture_afl_single() {
   local d="$1"
-  mkdir -p "$d/queue" "$d/crashes" "$d/timeouts"
+  mkdir -p "$d/queue" "$d/crashes" "$d/hangs"
   : > "$d/queue/id:000000,time:0,src:000"
   : > "$d/queue/id:000001,time:100,src:000"
   : > "$d/crashes/id:000000,sig:11,src:000"
-  : > "$d/timeouts/id:000000,src:000"
+  : > "$d/hangs/id:000000,src:000"
   : > "$d/fuzzer_stats"
 }
 
@@ -35,13 +35,13 @@ mkfixture_afl_single() {
 mkfixture_afl_parallel() {
   local d="$1" w
   for w in main secondary1 secondary2; do
-    mkdir -p "$d/$w/queue" "$d/$w/crashes" "$d/$w/timeouts"
+    mkdir -p "$d/$w/queue" "$d/$w/crashes" "$d/$w/hangs"
     : > "$d/$w/queue/id:000000,time:0,src:000"
     : > "$d/$w/queue/id:000001,time:10,src:000"
     : > "$d/$w/fuzzer_stats"
   done
   : > "$d/main/crashes/id:000000,sig:11,src:000"
-  : > "$d/secondary1/timeouts/id:000000,src:000"
+  : > "$d/secondary1/hangs/id:000000,src:000"
 }
 
 # mkfixture_libfuzzer <dir>
