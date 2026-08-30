@@ -1,5 +1,6 @@
 # v1.3-dev
 - added --batch for better performance
+- fixed AFL++ directory, it is .../hangs not .../timeouts
 - more performance fixes
 
 # v1.2
