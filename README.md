@@ -62,7 +62,7 @@ The coverage reports can be augmented with harness reachability information from
 
 | Fuzzer     | Detected by                                | Input files replayed                                                          |
 |------------|--------------------------------------------|-------------------------------------------------------------------------------|
-| AFL++      | queue/crashes/timeouts under `<dir>` or a worker | `queue/id:*`, `crashes/id:*`, `timeouts/id:*`                            |
+| AFL++      | queue/crashes/timeouts under `<dir>` or a worker | `queue/id:*`, `crashes/id:*`, `hangs/id:*`                            |
 | libFuzzer  | flat directory of files, no `queue/`       | all files except `crash-*`/`leak-*`/`oom-*`/`timeout-*`/`slow-unit-*`        |
 | libafl     | flat directory of files, no `queue/`       | all files except `crash-*`/`leak-*`/`oom-*`/`timeout-*`/`slow-unit-*`        |
 | honggfuzz  | flat directory of files, no `queue/`       | all files except `SIG*.fuzz` and `HONGGFUZZ.REPORT.TXT`                       |
@@ -159,7 +159,7 @@ cov-analysis -d /path/to/afl-fuzz-output/ -e "./cov @@" -t 8
 
 `cov-analysis` will for AFL++:
 1. Replay all `queue/id:*` files, in batch when the binary allows it (see `--batch`)
-2. Replay `crashes/id:*` and `timeouts/id:*` one-by-one with a timeout
+2. Replay `crashes/id:*` and `hangs/id:*` one-by-one with a timeout
 3. Merge `.profraw` profiles with `llvm-profdata`
 4. Generate reports in `/path/to/afl-fuzz-output/cov/`
 

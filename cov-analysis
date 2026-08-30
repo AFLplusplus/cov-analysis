@@ -5,7 +5,7 @@
 #  Version: 1.3-dev
 #
 #  Purpose: Generate LLVM source-based code coverage reports from AFL++ corpus.
-#           Replays queue/crash/timeout files through a coverage-instrumented
+#           Replays queue/crash/hang files through a coverage-instrumented
 #           binary, merges .profraw profiles, and produces HTML/text/JSON
 #           reports via llvm-profdata and llvm-cov.
 #
@@ -879,16 +879,16 @@ resolve_batch_size() {
 }
 
 # Classify $AFL_DIR as one of:
-#   afl    — AFL++ layout: a queue/crashes/timeouts directory exists
+#   afl    — AFL++ layout: a queue/crashes/hangs directory exists
 #   flat   — libFuzzer/libafl/honggfuzz flat corpus or crash dir (≥1 regular file)
 #   empty  — directory is empty or unreadable
 detect_fuzzer_layout() {
-  if test -d "$AFL_DIR/queue" || test -d "$AFL_DIR/crashes" || test -d "$AFL_DIR/timeouts"; then
+  if test -d "$AFL_DIR/queue" || test -d "$AFL_DIR/crashes" || test -d "$AFL_DIR/hangs"; then
     echo "afl"; return 0
   fi
   local p
   shopt -s nullglob
-  for p in "$AFL_DIR"/*/queue "$AFL_DIR"/*/crashes "$AFL_DIR"/*/timeouts; do
+  for p in "$AFL_DIR"/*/queue "$AFL_DIR"/*/crashes "$AFL_DIR"/*/hangs; do
     if test -d "$p"; then
       shopt -u nullglob
       echo "afl"; return 0
@@ -939,11 +939,11 @@ find_crash_timeout_files() {
     afl)
       local paths=()
       test -d "$AFL_DIR/crashes"  && paths+=("$AFL_DIR/crashes")
-      test -d "$AFL_DIR/timeouts" && paths+=("$AFL_DIR/timeouts")
+      test -d "$AFL_DIR/hangs" && paths+=("$AFL_DIR/hangs")
       local p
       shopt -s nullglob
       for p in "$AFL_DIR"/*/crashes  ; do paths+=("$p"); done
-      for p in "$AFL_DIR"/*/timeouts ; do paths+=("$p"); done
+      for p in "$AFL_DIR"/*/hangs ; do paths+=("$p"); done
       shopt -u nullglob
       if test "${#paths[@]}" -gt 0; then
         find "${paths[@]}" -maxdepth 1 -type f -name 'id:*' -print0 2>/dev/null || true
@@ -1814,7 +1814,7 @@ cmd_stability() {
     FUZZER_LAYOUT="$(detect_fuzzer_layout)"
   fi
   case "$FUZZER_LAYOUT" in
-    afl)   log "Fuzzer layout   : AFL++ (queue/crashes/timeouts)" ;;
+    afl)   log "Fuzzer layout   : AFL++ (queue/crashes/hangs)" ;;
     flat)  log "Fuzzer layout   : flat (libFuzzer/libafl/honggfuzz)" ;;
     empty)
       err "No input files found in $AFL_DIR"
@@ -2310,7 +2310,7 @@ cmd_search() {
     FUZZER_LAYOUT="$(detect_fuzzer_layout)"
   fi
   case "$FUZZER_LAYOUT" in
-    afl)  loge "Fuzzer layout   : AFL++ (queue/crashes/timeouts)" ;;
+    afl)  loge "Fuzzer layout   : AFL++ (queue/crashes/hangs)" ;;
     flat) loge "Fuzzer layout   : flat (libFuzzer/libafl/honggfuzz)" ;;
     empty)
       err "No input files found in $AFL_DIR"
@@ -4536,7 +4536,7 @@ cmd_report() {
       FUZZER_LAYOUT="$(detect_fuzzer_layout)"
     fi
     case "$FUZZER_LAYOUT" in
-      afl)  log "Fuzzer layout   : AFL++ (queue/crashes/timeouts)" ;;
+      afl)  log "Fuzzer layout   : AFL++ (queue/crashes/hangs)" ;;
       flat) log "Fuzzer layout   : flat (libFuzzer/libafl/honggfuzz)" ;;
       empty)
         err "No input files found in $AFL_DIR"
