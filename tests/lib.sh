@@ -70,6 +70,26 @@ mkfixture_honggfuzz() {
   : > "$d/HONGGFUZZ.REPORT.TXT"
 }
 
+mkfixture_libafl() {
+  local d="$1"
+  mkdir -p "$d/corpus" "$d/crashes"
+  : > "$d/corpus/3f2a9c1d7e8b4a60"
+  : > "$d/corpus/9b1e44d0c2a7f315"
+  : > "$d/corpus/.3f2a9c1d7e8b4a60.metadata"
+  : > "$d/corpus/.3f2a9c1d7e8b4a60.lafl_lock"
+  : > "$d/crashes/c0ffee1234567890"
+  : > "$d/crashes/.c0ffee1234567890.metadata"
+}
+
+mkfixture_libafl_queue() {
+  local d="$1"
+  mkdir -p "$d/queue" "$d/solutions"
+  : > "$d/queue/0011223344556677"
+  : > "$d/queue/8899aabbccddeeff"
+  : > "$d/queue/a1b2c3d4e5f60718"
+  : > "$d/solutions/deadbeefdeadbeef"
+}
+
 # mktmp — returns a tempdir path; auto-cleanup on EXIT via caller's trap
 mktmp() { mktemp -d "${TMPDIR:-/tmp}/afl-cov-test.XXXXXX"; }
 

@@ -101,6 +101,7 @@ QUEUE_TIMEOUT_FACTOR=5
 QUEUE_TIMEOUT_MIN=5
 QUEUE_TIMEOUT_FALLBACK=60
 BATCH_SIZE_DEFAULT=128
+BATCH_DEADLINE_INPUTS=10
 
 # Print "<max slowest_exec_ms> <instances>" over every fuzzer_stats an AFL++
 # output directory holds (one per parallel instance). exec_timeout stands in
@@ -149,11 +150,17 @@ derive_queue_timeout() {
 }
 
 run_with_timeout() {
-  local seconds="$1" rc=0 pid
+  local seconds="$1" rc=0 pid restore prev="${!-}"
   shift
+  restore="$(trap -p INT TERM HUP)"
+  trap 'test "${!-}" = "$prev" || kill -KILL -- "-$!" "$!" 2>/dev/null; exit 130' INT
+  trap 'test "${!-}" = "$prev" || kill -KILL -- "-$!" "$!" 2>/dev/null; exit 143' TERM
+  trap 'test "${!-}" = "$prev" || kill -KILL -- "-$!" "$!" 2>/dev/null; exit 129' HUP
   timeout --signal=TERM --kill-after=1s "${seconds}s" "$@" <&0 &
   pid=$!
   wait "$pid" || rc=$?
+  trap - INT TERM HUP
+  eval "$restore"
   kill -KILL -- "-$pid" 2>/dev/null || true
   return "$rc"
 }
@@ -161,7 +168,7 @@ run_with_timeout() {
 command_for_input() {
   local cmd="$1" input="$2" quoted
   printf -v quoted '%q' "$input"
-  printf '%s' "${cmd/@@/$quoted}"
+  printf '%s%s%s' "${cmd%%@@*}" "$quoted" "${cmd#*@@}"
 }
 
 run_input_command() {
@@ -213,23 +220,53 @@ replay_one_input() {
   printf '%d\n' "$status"
 }
 
-# Replay one batch of inputs in a single process. Only driver binaries take
-# this path, so the per-input deadline is the driver's own alarm
-# (COV_INPUT_TIMEOUT); the outer deadline is the batch-wide backstop for driver
-# binaries built before that alarm existed.
+replay_one_input_repeated() {
+  local record="$4"
+  export COV_REPEAT_TAG="${record%%$'\t'*}"
+  replay_one_input "$@"
+}
+
+# Replay one batch of inputs in a single process that profiles into a directory
+# of its own. The outer deadline is the per-input deadline times the batch size,
+# but at most <cap> per-input deadlines unless <cap> is 0. A driver binary gets
+# no cap: it bounds each input with its own alarm (COV_INPUT_TIMEOUT), so the
+# outer deadline only has to allow for every input of a slow but healthy batch.
+# A batch that exits non-zero or is killed is discarded, counted in
+# COV_BATCH_FALLBACK_LOG, and its inputs are replayed one per process, so a
+# crashing or hanging input costs no other input its coverage.
 replay_batch() {
-  local cmd="$1" seconds="$2" dir="$3" prefix status
-  shift 3
-  prefix="${1##*/}"
-  prefix="${prefix//[^A-Za-z0-9._-]/_}"
-  export LLVM_PROFILE_FILE="$dir/b_${prefix}-%p.profraw"
+  local cmd="$1" seconds="$2" cap="$3" dir="$4" bdir status n=0 path deadline
+  shift 4
+  if ! bdir="$(mktemp -d "$dir/b.XXXXXX")"; then
+    printf '1 %d\n' "$#"
+    return 0
+  fi
+  export LLVM_PROFILE_FILE="$bdir/%p.profraw"
   if test "$seconds" -gt 0; then
-    run_with_timeout "$(( $# * seconds ))" bash -c "$cmd \"\$@\"" _ "$@" >/dev/null 2>&1
+    deadline="$#"
+    if test "$cap" -gt 0 && test "$deadline" -gt "$cap"; then
+      deadline="$cap"
+    fi
+    run_with_timeout "$((deadline * seconds))" \
+      bash -c "$cmd \"\$@\"" _ "$@" >/dev/null 2>&1
   else
     bash -c "$cmd \"\$@\"" _ "$@" >/dev/null 2>&1
   fi
   status=$?
-  printf '%d %d\n' "$status" "$#"
+  if test "$status" -eq 0; then
+    printf '0 %d\n' "$#"
+    return 0
+  fi
+  test -z "${COV_BATCH_FALLBACK_LOG:-}" || printf '%d\n' "$#" >> "$COV_BATCH_FALLBACK_LOG"
+  rm -rf -- "$bdir"
+  if ! mkdir -- "$bdir"; then
+    printf '%d %d\n' "$status" "$#"
+    return 0
+  fi
+  for path in "$@"; do
+    n=$((n + 1))
+    replay_one_input "$cmd @@" "$seconds" "$bdir" "$n"$'\t'"$path"
+  done
 }
 
 # Name an input that hit its deadline. The driver appends to the same file when
@@ -258,7 +295,7 @@ resolve_input_dir() {
 # through here, so the counter needs no second channel. With <expected> set it
 # prints a progress line to stderr at most every 2 seconds: a replay that is
 # merely slow keeps a rate, a wedged one drops to 0/s. In batch mode one record
-# covers a whole batch, so progress advances in batch-sized steps.
+# covers a clean batch, so progress advances in batch-sized steps.
 replay_tally() {
   local driver="$1" expected="${2:-0}" label="${3:-files}"
   awk -v driver="$driver" -v expected="$expected" -v label="$label" \
@@ -544,6 +581,12 @@ publish_report() {
   local stage="$1" destination="$2" parent base rollback=""
   parent="$(dirname -- "$destination")"
   base="$(basename -- "$destination")"
+  if test -d "$destination" && mv --exchange -T -- "$stage" "$destination" 2>/dev/null; then
+    if ! rm -rf -- "$stage"; then
+      err "Report published, but the previous report could not be removed: $stage"
+    fi
+    return 0
+  fi
   if test -e "$destination"; then
     rollback="$parent/.${base}.cov-analysis.rollback.$$.${RANDOM}"
     while test -e "$rollback"; do
@@ -577,11 +620,46 @@ COV_REPORT_CLEAN_LOCK=""
 COV_LOCK_PID=""
 COV_LOCK_HOST=""
 COV_LOCK_STARTED=""
+COV_REMOTE_HOST=""
+COV_REMOTE_WORKDIR=""
+COV_REMOTE_SSHOPTS=()
 
 cleanup_report_work() {
   test -z "$COV_REPORT_CLEAN_PROFRAW" || rm -rf -- "$COV_REPORT_CLEAN_PROFRAW"
   test -z "$COV_REPORT_CLEAN_STAGE" || rm -rf -- "$COV_REPORT_CLEAN_STAGE"
   test -z "$COV_REPORT_CLEAN_LOCK" || rm -rf -- "$COV_REPORT_CLEAN_LOCK"
+  remote_cleanup
+}
+
+remote_cleanup() {
+  local host="$COV_REMOTE_HOST" rd="$COV_REMOTE_WORKDIR" script
+  test -n "$host" && test -n "$rd" || return 0
+  COV_REMOTE_HOST=""
+  COV_REMOTE_WORKDIR=""
+  script="rd=$(printf '%q' "$rd")"'
+pid=$(cat "$rd/pid" 2>/dev/null)
+if test -n "$pid" && tr "\0" " " < "/proc/$pid/cmdline" 2>/dev/null | grep -qF -- "$rd/cov-analysis"; then
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+  i=0
+  while kill -0 "$pid" 2>/dev/null && test "$i" -lt 10; do sleep 1; i=$((i + 1)); done
+  kill -KILL -- "-$pid" 2>/dev/null
+fi
+rm -rf -- "$rd"'
+  ssh ${COV_REMOTE_SSHOPTS[@]+"${COV_REMOTE_SSHOPTS[@]}"} -o ConnectTimeout=15 "$host" 'bash -s' \
+    <<< "$script" >/dev/null 2>&1 || true
+}
+
+parse_ssh_opts() {
+  local opts="$1" o
+  COV_REMOTE_SSHOPTS=()
+  test -n "$opts" || return 0
+  if ! printf '%s\n' "$opts" | xargs -r printf '' >/dev/null 2>&1; then
+    err "--ssh-opts has an unbalanced quote: $opts"
+    return 1
+  fi
+  while IFS= read -r -d '' o; do
+    COV_REMOTE_SSHOPTS+=("$o")
+  done < <(printf '%s\n' "$opts" | xargs -r printf '%s\0')
 }
 
 # A signal must still end the run: a trap that only cleans up would let the
@@ -597,9 +675,10 @@ install_cleanup_traps() {
 
 # ── report directory lock ─────────────────────────────────────────────────────
 # Two runs against one -o both used to proceed, and the collision only surfaced
-# several steps later as a missing staging file. The lock is a directory, which
-# is atomic to create and needs no flock: --remote ships this script to hosts
-# whose command set is unknown.
+# several steps later as a missing staging file. The lock is a directory, built
+# complete with its owner file under a temporary name and renamed into place:
+# the rename is atomic, fails while another lock exists, and needs no flock
+# (--remote ships this script to hosts whose command set is unknown).
 
 report_lock_path() {
   printf '%s/.%s.cov-analysis.lock' "$1" "$2"
@@ -662,15 +741,51 @@ report_lock_live() {
   return 0
 }
 
+report_lock_refused() {
+  err "Report directory is in use by cov-analysis (pid $COV_LOCK_PID on ${COV_LOCK_HOST:-this host}):"
+  err "  $1"
+  err "Wait for that run to finish, or pass --force to take the directory over."
+}
+
 acquire_report_lock() {
-  local parent="$1" base="$2" force="${3:-0}" dir
+  local parent="$1" base="$2" force="${3:-0}" dir new guard tries=0
   dir="$(report_lock_path "$parent" "$base")"
-  if ! mkdir -- "$dir" 2>/dev/null; then
+  if ! new="$(mktemp -d "$dir.new.XXXXXX")"; then
+    err "Could not lock the report directory: $dir"
+    return 1
+  fi
+  chmod -- "$(umask -S)" "$new" 2>/dev/null || true
+  {
+    printf 'pid %s\n' "$$"
+    printf 'started %s\n' "$(pid_start_time "$$")"
+    printf 'host %s\n' "$(this_host)"
+  } > "$new/owner"
+  if mv -T -- "$new" "$dir" 2>/dev/null; then
+    COV_REPORT_CLEAN_LOCK="$dir"
+    return 0
+  fi
+  if test "$force" -ne 1 && report_lock_live "$dir"; then
+    rm -rf -- "$new"
+    report_lock_refused "$parent/$base"
+    return 1
+  fi
+  guard="$dir.takeover"
+  until mkdir -- "$guard" 2>/dev/null; do
+    tries=$((tries + 1))
+    if test "$tries" -ge 5; then
+      rm -rf -- "$new"
+      err "Could not lock the report directory: another run holds $guard."
+      err "If no other cov-analysis run is starting, remove it with --clean."
+      return 1
+    fi
+    sleep 1
+  done
+  if ! mv -T -- "$new" "$dir" 2>/dev/null; then
     if report_lock_live "$dir"; then
       if test "$force" -ne 1; then
-        err "Report directory is in use by cov-analysis (pid $COV_LOCK_PID on ${COV_LOCK_HOST:-this host}):"
-        err "  $parent/$base"
-        err "Wait for that run to finish, or pass --force to take the directory over."
+        rm -rf -- "$new"
+        rmdir -- "$guard"
+        report_lock_refused "$parent/$base"
         return 1
       fi
       logw "Taking over the report directory from pid $COV_LOCK_PID (--force)."
@@ -678,16 +793,14 @@ acquire_report_lock() {
       logv "Removing a lock left by a run that is no longer alive: $dir"
     fi
     rm -rf -- "$dir"
-    if ! mkdir -- "$dir" 2>/dev/null; then
+    if ! mv -T -- "$new" "$dir" 2>/dev/null; then
+      rm -rf -- "$new"
+      rmdir -- "$guard"
       err "Could not lock the report directory: $dir"
       return 1
     fi
   fi
-  {
-    printf 'pid %s\n' "$$"
-    printf 'started %s\n' "$(pid_start_time "$$")"
-    printf 'host %s\n' "$(this_host)"
-  } > "$dir/owner"
+  rmdir -- "$guard"
   COV_REPORT_CLEAN_LOCK="$dir"
   return 0
 }
@@ -705,7 +818,14 @@ clean_report_workspace() {
   if test -d "$lock"; then
     rm -rf -- "$lock" && { log "Removed stale lock: $lock"; removed=$((removed + 1)); }
   fi
+  if test -d "$lock.takeover"; then
+    rm -rf -- "$lock.takeover" \
+      && { log "Removed a stale lock takeover guard: $lock.takeover"; removed=$((removed + 1)); }
+  fi
   shopt -s nullglob
+  for p in "$lock.new."*; do
+    rm -rf -- "$p" && { log "Removed a half-built lock: $p"; removed=$((removed + 1)); }
+  done
   for p in "$parent/.$base.cov-analysis.stage."*; do
     rm -rf -- "$p" && { log "Removed stale staging directory: $p"; removed=$((removed + 1)); }
   done
@@ -844,6 +964,12 @@ is_cov_driver_binary() {
   grep -qaF '###SIGNATURE_LLVMFUZZERTESTONEINPUT_COVERAGE###' "$bin" 2>/dev/null
 }
 
+cov_driver_can_repeat() {
+  local bin="$1"
+  test -n "$bin" || return 1
+  grep -qaF '###COV_DRIVER_REPEAT###' "$bin" 2>/dev/null
+}
+
 # If the coverage command has no @@ placeholder but the binary is a cov-analysis
 # driver (argv-only input), append @@ so the forgotten placeholder is supplied
 # automatically. Echoes the (possibly adjusted) command. A trailing @@ also lets
@@ -878,25 +1004,54 @@ resolve_batch_size() {
   fi
 }
 
-# Classify $AFL_DIR as one of:
-#   afl    — AFL++ layout: a queue/crashes/hangs directory exists
-#   flat   — libFuzzer/libafl/honggfuzz flat corpus or crash dir (≥1 regular file)
-#   empty  — directory is empty or unreadable
-detect_fuzzer_layout() {
-  if test -d "$AFL_DIR/queue" || test -d "$AFL_DIR/crashes" || test -d "$AFL_DIR/hangs"; then
-    echo "afl"; return 0
-  fi
-  local p
-  shopt -s nullglob
-  for p in "$AFL_DIR"/*/queue "$AFL_DIR"/*/crashes "$AFL_DIR"/*/hangs; do
-    if test -d "$p"; then
-      shopt -u nullglob
-      echo "afl"; return 0
+has_visible_files() {
+  local d
+  for d in "$@"; do
+    test -d "$d" || continue
+    if find "$d" -maxdepth 1 -type f ! -name '.*' -print -quit 2>/dev/null | grep -q .; then
+      return 0
     fi
   done
+  return 1
+}
+
+# Classify $AFL_DIR as one of:
+#   afl    — AFL++ layout: queue/crashes/hangs holding id:* entries, or a
+#            fuzzer_stats file beside them
+#   libafl — LibAFL layout: entries in corpus/ or queue/ beside a crashes/ or
+#            solutions/ directory, or with no non-hidden file beside them;
+#            or entries only in crashes/ or solutions/
+#   flat   — libFuzzer/libafl/honggfuzz flat corpus or crash dir (≥1 regular,
+#            non-hidden file)
+#   empty  — directory is empty or unreadable
+detect_fuzzer_layout() {
+  local p afl_stats=0
+  local -a afl_dirs=()
+  test -f "$AFL_DIR/fuzzer_stats" && afl_stats=1
+  shopt -s nullglob
+  for p in "$AFL_DIR/queue" "$AFL_DIR/crashes" "$AFL_DIR/hangs" \
+           "$AFL_DIR"/*/queue "$AFL_DIR"/*/crashes "$AFL_DIR"/*/hangs; do
+    test -d "$p" && afl_dirs+=("$p")
+  done
+  for p in "$AFL_DIR"/*/fuzzer_stats; do afl_stats=1; done
   shopt -u nullglob
-  if find "$AFL_DIR" -maxdepth 1 -type f -print -quit 2>/dev/null | grep -q .; then
+  if test "${#afl_dirs[@]}" -gt 0; then
+    if test "$afl_stats" -eq 1 \
+       || find "${afl_dirs[@]}" -maxdepth 1 -type f -name 'id:*' -print -quit 2>/dev/null | grep -q .; then
+      echo "afl"; return 0
+    fi
+  fi
+  if has_visible_files "$AFL_DIR/corpus" "$AFL_DIR/queue"; then
+    if test -d "$AFL_DIR/crashes" || test -d "$AFL_DIR/solutions" \
+       || ! has_visible_files "$AFL_DIR"; then
+      echo "libafl"; return 0
+    fi
+  fi
+  if has_visible_files "$AFL_DIR"; then
     echo "flat"; return 0
+  fi
+  if has_visible_files "$AFL_DIR/crashes" "$AFL_DIR/solutions"; then
+    echo "libafl"; return 0
   fi
   echo "empty"
 }
@@ -916,10 +1071,20 @@ find_queue_files() {
         find "${paths[@]}" -maxdepth 1 -type f -name 'id:*' -print0 2>/dev/null || true
       fi
       ;;
+    libafl)
+      local paths=() p
+      for p in "$AFL_DIR/corpus" "$AFL_DIR/queue"; do
+        test -d "$p" && paths+=("$p")
+      done
+      if test "${#paths[@]}" -gt 0; then
+        find "${paths[@]}" -maxdepth 1 -type f ! -name '.*' -print0 2>/dev/null || true
+      fi
+      ;;
     flat)
-      # libFuzzer/libafl/honggfuzz flat corpus: every regular file that isn't a
-      # known crash artifact or metadata file.
+      # libFuzzer/libafl/honggfuzz flat corpus: every regular file that isn't
+      # hidden, a known crash artifact or a metadata file.
       find "$AFL_DIR" -maxdepth 1 -type f \
+        ! -name '.*' \
         ! -name 'crash-*' \
         ! -name 'leak-*' \
         ! -name 'oom-*' \
@@ -947,6 +1112,15 @@ find_crash_timeout_files() {
       shopt -u nullglob
       if test "${#paths[@]}" -gt 0; then
         find "${paths[@]}" -maxdepth 1 -type f -name 'id:*' -print0 2>/dev/null || true
+      fi
+      ;;
+    libafl)
+      local paths=() p
+      for p in "$AFL_DIR/crashes" "$AFL_DIR/solutions"; do
+        test -d "$p" && paths+=("$p")
+      done
+      if test "${#paths[@]}" -gt 0; then
+        find "${paths[@]}" -maxdepth 1 -type f ! -name '.*' -print0 2>/dev/null || true
       fi
       ;;
     flat)
@@ -1045,16 +1219,20 @@ emit_driver() {
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
-#include <setjmp.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 int LLVMFuzzerInitialize(int *argc, char ***argv) __attribute__((weak));
 int LLVMFuzzerTestOneInput(const unsigned char*, size_t);
 
 extern int __llvm_profile_write_file(void);
+extern int __llvm_profile_dump(void);
+extern void __llvm_profile_reset_counters(void);
+extern void __llvm_profile_set_filename(const char *);
 
 static void crash_handler(int sig) {
     __llvm_profile_write_file();
+    signal(sig, SIG_DFL);
     raise(sig);
 }
 
@@ -1063,26 +1241,49 @@ static void install_crash_handlers(void) {
     const int sigs[] = { SIGABRT, SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTERM };
     struct sigaction sa = {
         .sa_handler = crash_handler,
-        .sa_flags   = SA_RESETHAND,
     };
-    sigemptyset(&sa.sa_mask);
+    sigfillset(&sa.sa_mask);
     for (int i = 0; i < (int)(sizeof(sigs) / sizeof(sigs[0])); i++)
         sigaction(sigs[i], &sa, NULL);
 }
 
 /* Per-input deadline, in seconds, from COV_INPUT_TIMEOUT (0 disables it).
  * One process handles a whole batch of inputs, so an outer timeout can only
- * kill the batch; this bounds each input on its own. The handler does nothing
- * but jump back into the loop, which keeps it async-signal-safe. A harness left
- * in an inconsistent state by that jump is accepted: this is a coverage replay,
- * and the alternative is a worker pinned forever.
+ * kill the batch; this bounds each input on its own. An input that exceeds it
+ * is named on stderr and in the file COV_TIMEOUT_LOG points at, and the process
+ * ends at once with status 124: the harness may have been stopped while holding
+ * a lock, so nothing else, the profile writer included, is safe to run.
+ * cov-analysis replays the other inputs of the batch one per process. The
+ * handler makes only async-signal-safe calls, on messages prepared before each
+ * input.
  */
-static sigjmp_buf input_timeout_jmp;
 static unsigned input_timeout = 0;
+static const char *timeout_log = NULL;
+static char timeout_message[4352];
+static char timeout_line[4352];
+
+static void write_all(int fd, const char *s) {
+    size_t n = strlen(s);
+    while (n > 0) {
+        ssize_t w = write(fd, s, n);
+        if (w <= 0) return;
+        s += w;
+        n -= (size_t)w;
+    }
+}
 
 static void alarm_handler(int sig) {
+    int fd;
     (void)sig;
-    siglongjmp(input_timeout_jmp, 1);
+    write_all(2, timeout_message);
+    if (timeout_log) {
+        fd = open(timeout_log, O_WRONLY | O_APPEND | O_CREAT, 0644);
+        if (fd >= 0) {
+            write_all(fd, timeout_line);
+            close(fd);
+        }
+    }
+    _exit(124);
 }
 
 static void install_alarm_handler(void) {
@@ -1091,43 +1292,66 @@ static void install_alarm_handler(void) {
     if (!value || !*value) return;
     input_timeout = (unsigned)strtoul(value, NULL, 10);
     if (input_timeout == 0) return;
+    timeout_log = getenv("COV_TIMEOUT_LOG");
+    if (timeout_log && !*timeout_log) timeout_log = NULL;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = alarm_handler;
-    sigemptyset(&sa.sa_mask);
+    sigfillset(&sa.sa_mask);
     sigaction(SIGALRM, &sa, NULL);
 }
 
-/* Name a timed-out input in the file COV_TIMEOUT_LOG points at, so the report
- * can list it. Not called from the signal handler.
- */
-static void log_timed_out_input(const char *path) {
-    const char *log = getenv("COV_TIMEOUT_LOG");
-    FILE *f;
-    if (!log || !*log) return;
-    f = fopen(log, "a");
-    if (!f) return;
-    fprintf(f, "%s\n", path);
-    fclose(f);
+static void run_one_input(const char *path, const unsigned char *buf, size_t len) {
+    if (input_timeout) {
+        snprintf(timeout_message, sizeof(timeout_message),
+                 "Error: timeout after %us: %s\n", input_timeout, path);
+        snprintf(timeout_line, sizeof(timeout_line), "%s\n", path);
+        alarm(input_timeout);
+    }
+    LLVMFuzzerTestOneInput(buf, len);
+    if (input_timeout) alarm(0);
 }
 
-/* The jump target lives in its own function so that no local of main() is
- * modified between sigsetjmp and siglongjmp. Returns 1 when the deadline hit.
- */
-static int run_one_input(const unsigned char *buf, size_t len) {
-    if (sigsetjmp(input_timeout_jmp, 1) == 0) {
-        if (input_timeout) alarm(input_timeout);
-        LLVMFuzzerTestOneInput(buf, len);
-        alarm(0);
-        return 0;
+static unsigned repeat_count = 0;
+static unsigned repeat_first = 1;
+static const char *repeat_dir = NULL;
+static const char *repeat_tag = NULL;
+static char repeat_scratch[4096];
+static char repeat_path[4096];
+
+static void install_repeat(void) {
+    const char *count = getenv("COV_REPEAT");
+    const char *first = getenv("COV_REPEAT_FIRST");
+    repeat_dir = getenv("COV_REPEAT_DIR");
+    repeat_tag = getenv("COV_REPEAT_TAG");
+    if (!count || !*count || !repeat_dir || !*repeat_dir || !repeat_tag || !*repeat_tag)
+        return;
+    if (first && *first) repeat_first = (unsigned)strtoul(first, NULL, 10);
+    snprintf(repeat_scratch, sizeof(repeat_scratch), "%s/scratch/%ld.profraw",
+             repeat_dir, (long)getpid());
+    repeat_count = (unsigned)strtoul(count, NULL, 10);
+}
+
+static void run_repeated(const char *path, const unsigned char *buf, size_t len,
+                         int pos) {
+    __llvm_profile_set_filename(repeat_scratch);
+    run_one_input(path, buf, len);
+    for (unsigned r = 0; r < repeat_count; r++) {
+        __llvm_profile_set_filename(repeat_scratch);
+        __llvm_profile_reset_counters();
+        run_one_input(path, buf, len);
+        snprintf(repeat_path, sizeof(repeat_path), "%s/run_%u/%s-%ld-%d.profraw",
+                 repeat_dir, repeat_first + r, repeat_tag, (long)getpid(), pos);
+        __llvm_profile_set_filename(repeat_path);
+        __llvm_profile_dump();
     }
-    alarm(0);
-    return 1;
+    __llvm_profile_set_filename(repeat_scratch);
 }
 
 int main(int argc, char **argv) {
     // needed for auto-detection in compiled binaries:
     if (argc == 2 && strcmp(argv[1], "--printsignature") == 0) {
-        printf("###SIGNATURE_LLVMFUZZERTESTONEINPUT_COVERAGE###\n");
+        printf("###SIGNATURE_LLVMFUZZERTESTONEINPUT_COVERAGE###\n"
+               "###COV_DRIVER_REPEAT###\n");
         return 0;
     }
 
@@ -1137,6 +1361,7 @@ int main(int argc, char **argv) {
     }
 
     install_alarm_handler();
+    install_repeat();
 
     if (LLVMFuzzerInitialize) {
         fprintf(stderr, "Running LLVMFuzzerInitialize ...\n");
@@ -1145,7 +1370,6 @@ int main(int argc, char **argv) {
 
     int unusable = 0;
     int empty = 0;
-    int timed_out = 0;
 
     for (int i = 1; i < argc; i++) {
         FILE *f = fopen(argv[i], "rb");
@@ -1180,12 +1404,10 @@ int main(int argc, char **argv) {
         if (n_read > 0) {
             fprintf(stderr, "Running: %s (%d/%d) %zu bytes\n",
                     argv[i], i, argc - 1, n_read);
-            if (run_one_input((const unsigned char*)buf, n_read)) {
-                fprintf(stderr, "Error: timeout after %us: %s\n",
-                        input_timeout, argv[i]);
-                log_timed_out_input(argv[i]);
-                timed_out++;
-            }
+            if (repeat_count)
+                run_repeated(argv[i], (const unsigned char*)buf, n_read, i);
+            else
+                run_one_input(argv[i], (const unsigned char*)buf, n_read);
         } else {
             fprintf(stderr, "Error: read failed for %s\n", argv[i]);
             unusable++;
@@ -1194,11 +1416,8 @@ int main(int argc, char **argv) {
         fclose(f);
     }
 
-    fprintf(stderr, "Done. %d input(s), %d unusable, %d empty, %d timed out.\n",
-            argc - 1, unusable, empty, timed_out);
-    /* A timed-out input is reported, never a failure: the batch's other inputs
-     * replayed, and the exit status has to keep saying so.
-     */
+    fprintf(stderr, "Done. %d input(s), %d unusable, %d empty.\n",
+            argc - 1, unusable, empty);
     return unusable ? 2 : 0;
 }
 DRIVER_EOF
@@ -1282,10 +1501,15 @@ Optional:
                      hand-written argv loop. Default: 128 for a cov-analysis
                      driver binary, otherwise one input per process. 0 or 1
                      forces one input per process. Above ~128 there is nothing
-                     measurable left to win. On a binary that is not a
-                     cov-analysis driver there is no per-input alarm, so one
-                     input that does not terminate costs its whole batch the
-                     coverage at the deadline; --batch 0 isolates it.
+                     measurable left to win. A batch that exits non-zero or is
+                     killed at its deadline is discarded and its inputs are
+                     replayed one per process, so a crashing or hanging input
+                     costs no other input its coverage; the run reports how many
+                     batches were replayed that way. On a binary that is not
+                     a cov-analysis driver there is no per-input alarm, so an
+                     input that does not terminate holds its batch until the
+                     batch deadline: the queue timeout times <num>, but at most
+                     10 times the queue timeout.
   --force            Take over a report directory another run holds.
   --clean            Remove the lock and staging directories of <-o> that no
                      running cov-analysis holds, then exit. A staging directory
@@ -1293,7 +1517,8 @@ Optional:
   --binary <path>    Instrumented binary used by LLVM and driver detection.
                      Required when -e contains a quoted binary path, wrapper,
                      or other shell syntax that cannot be inferred safely.
-  --layout <kind>    Force layout: 'afl' or 'flat' (default: auto-detect)
+  --layout <kind>    Force layout: 'afl', 'libafl' or 'flat' (default:
+                     auto-detect)
   --max-replay-failures <pct>
                      Fail the run when more than <pct> percent of the queue
                      inputs did not replay cleanly (default: 99, so a corpus in
@@ -1338,10 +1563,14 @@ Optional:
                      used for rendering, and -o is required. cov-analysis
                      copies itself over, runs --replay-only there, brings back
                      coverage.profdata, and removes its remote working
-                     directory on success and on failure. Needs ssh and scp.
+                     directory however the run ends. A replay still running
+                     there after Ctrl-C or a dropped connection is stopped
+                     first. Needs ssh and scp.
   --ssh-opts <opts>  Options handed to both ssh and scp (e.g.
                      "-o Port=2222 -o IdentityFile=~/.ssh/fuzz"). Use the
-                     -o Key=Value form: ssh and scp disagree about -p.
+                     -o Key=Value form: ssh and scp disagree about -p. Quote a
+                     value that contains spaces, as the shell would:
+                     "-o 'IdentityFile=/keys/fuzz key'".
   --remote-dir <dir> Remote working directory (default: a mktemp -d under the
                      remote TMPDIR)
   --migrate-existing-report
@@ -1371,10 +1600,10 @@ Examples:
   cov-analysis -d out -e "./cov @@" --queue-timeout 30
 
   # Do NOT wrap the target in `timeout -s KILL` to bound it yourself. Batch
-  # replay puts many inputs in one process, so SIGKILL throws away the unwritten
-  # profile of every input in that batch, and a wrapper in -e also forces
-  # --binary. Use --queue-timeout; if you must wrap, wrap as `timeout -k 5 15`
-  # so the driver still flushes its profile on TERM.
+  # replay puts many inputs in one process, so SIGKILL discards the profile of
+  # the whole batch, which then has to be replayed one input per process, and a
+  # wrapper in -e also forces --binary. Use --queue-timeout; if you must wrap,
+  # wrap as `timeout -k 5 15` so the driver still flushes its profile on TERM.
 
   # Clear what a killed run left behind, then re-run
   cov-analysis -d out -o coverage --clean
@@ -1460,6 +1689,14 @@ Usage: cov-analysis driver [-o output.c]
   inputs are reported but are not an error. cov-analysis report treats that
   exit 2 as a failed measurement rather than a target failure.
 
+  With COV_INPUT_TIMEOUT=<secs> set, an input that runs longer is named on
+  stderr and the driver exits at once with status 124; cov-analysis replays
+  the rest of that batch one input per process.
+
+  Under cov-analysis stability the driver runs each input several times in
+  one process and writes one profile per run (COV_REPEAT), so the analysis
+  sees state the harness carries between executions.
+
 Options:
   -o <file>     Write driver source to FILE instead of stdout
   -h, --help    Show this help
@@ -1510,6 +1747,15 @@ Usage: cov-analysis stability [options]
   Reports a stability percentage. If instability is found with the default
   4 runs, reruns for a total of 8 to confirm.
 
+  A cov-analysis driver binary runs each input N+1 times in a row in one
+  process and records every run but the first, the way AFL++ calibrates an
+  input in persistent mode. State a harness carries from one execution to the
+  next (a static counter, a cache, a growing buffer) therefore shows up as
+  instability, while one-time initialization in the first run does not. Other
+  binaries, and drivers built before this mode existed, run every execution in
+  a fresh process, which cannot see such state; --isolated selects that for a
+  driver binary too.
+
   Resilient to flaky passes: a pass whose profiles cannot be collected or
   merged (e.g. a crashing input that left a truncated .profraw behind) is
   skipped and the run continues with the remaining passes, as long as at
@@ -1546,7 +1792,11 @@ Optional:
                      Timed targets receive TERM, then KILL after 1 second.
   --binary <path>    Instrumented binary used by LLVM and driver detection;
                      required for ambiguous -e shell commands.
-  --layout <kind>    Force layout: 'afl' or 'flat' (default: auto-detect)
+  --isolated         Run every execution in a fresh process, also for a
+                     cov-analysis driver binary. Measures per-input
+                     determinism only.
+  --layout <kind>    Force layout: 'afl', 'libafl' or 'flat' (default:
+                     auto-detect)
   -v                 Verbose output
   -q                 Quiet mode (suppress all [+] output)
   -V                 Print version and exit
@@ -1554,6 +1804,7 @@ Optional:
 
 Examples:
   cov-analysis stability -d out -e "./cov @@"
+  cov-analysis stability -d out -e "./cov @@" --isolated
   cov-analysis stability -d out -e "./cov @@" -n 8 -s src/
   cov-analysis stability -d out -e "./cov @@" --exclude-regex '\.h$'
   cov-analysis stability -d ./corpus -e "./cov @@" -t 4
@@ -1587,7 +1838,8 @@ Optional:
                      replay; targets receive TERM, then KILL after 1 second.
   --binary <path>    Instrumented binary used by LLVM and driver detection;
                      required for ambiguous -e shell commands.
-  --layout <kind>    Force layout: 'afl' or 'flat' (default: auto-detect)
+  --layout <kind>    Force layout: 'afl', 'libafl' or 'flat' (default:
+                     auto-detect)
   -v                 Verbose output
   -q                 Quiet mode (suppress all [+] output)
   -V                 Print version and exit
@@ -1712,6 +1964,9 @@ cmd_stability() {
   local GAWK=""
   local STAB_KEPT=0    # inputs that produced coverage in every analyzed pass
   local EXCLUDE_FILTER=""
+  local ISOLATED=0
+  local STAB_INPROC=0
+  local STAB_ROUNDS=0
 
   if test $# -eq 0; then usage_stability; exit 1; fi
 
@@ -1726,6 +1981,7 @@ cmd_stability() {
       -t)        need_arg "-t" "${2-}"; FORKS="$2";                    shift 2 ;;
       -T)        need_arg "-T" "${2-}"; TIMEOUT="$2";                  shift 2 ;;
       --binary)  need_arg "--binary" "${2-}"; BINARY_OVERRIDE="$2";   shift 2 ;;
+      --isolated) ISOLATED=1;                   shift   ;;
       -v)        VERBOSE=1;                     shift   ;;
       -q)        QUIET=1;                       shift   ;;
       -V)        version_string; exit 0 ;;
@@ -1769,8 +2025,8 @@ cmd_stability() {
 
   if test -n "$FUZZER_LAYOUT"; then
     case "$FUZZER_LAYOUT" in
-      afl|flat) ;;
-      *) err "--layout must be 'afl' or 'flat' (got '$FUZZER_LAYOUT')"; exit 1 ;;
+      afl|libafl|flat) ;;
+      *) err "--layout must be 'afl', 'libafl' or 'flat' (got '$FUZZER_LAYOUT')"; exit 1 ;;
     esac
   fi
 
@@ -1783,6 +2039,17 @@ cmd_stability() {
   # Forgotten @@ on a driver binary → supply it automatically (argv-only input).
   COVERAGE_CMD="$(add_at_if_driver "$COVERAGE_CMD" "$COV_BINARY")"
   logv "Replay command  : $COVERAGE_CMD"
+
+  if test "$ISOLATED" -eq 0 && is_cov_driver_binary "$COV_BINARY"; then
+    if cov_driver_can_repeat "$COV_BINARY"; then
+      STAB_INPROC=1
+    else
+      logw "$COV_BINARY was built with an older cov-analysis driver that cannot"
+      logw "repeat an input in one process, so every execution runs in a fresh process"
+      logw "and state carried between executions stays invisible. Rebuild it with the"
+      logw "current 'cov-analysis driver' output to see it."
+    fi
+  fi
 
   # ── detect LLVM tools ──────────────────────────────────────────────────────
   LLVM_PROFDATA="$(find_tool llvm-profdata)" || {
@@ -1816,17 +2083,19 @@ cmd_stability() {
   case "$FUZZER_LAYOUT" in
     afl)   log "Fuzzer layout   : AFL++ (queue/crashes/hangs)" ;;
     flat)  log "Fuzzer layout   : flat (libFuzzer/libafl/honggfuzz)" ;;
+    libafl) log "Fuzzer layout   : LibAFL (corpus|queue, crashes|solutions)" ;;
     empty)
       err "No input files found in $AFL_DIR"
-      err "Expected one of: AFL++ out dir, libFuzzer/libafl corpus, honggfuzz workspace."
-      err "Override detection with --layout afl|flat if needed."
+      err "Expected one of: AFL++ or LibAFL output dir, libFuzzer/libafl corpus, honggfuzz workspace."
+      err "Override detection with --layout afl|libafl|flat if needed."
       exit 1
       ;;
   esac
 
   # ── prepare workspace ──────────────────────────────────────────────────────
   STAB_DIR="$(mktemp -d "$(tmp_base_dir)/cov-analysis-stability.XXXXXX")"
-  trap "rm -rf '$STAB_DIR'" EXIT INT TERM
+  COV_REPORT_CLEAN_PROFRAW="$STAB_DIR"
+  install_cleanup_traps
 
   local CORPUS_SIZE
   CORPUS_SIZE=$(count_files find_queue_files)
@@ -1839,6 +2108,17 @@ cmd_stability() {
   log "Corpus size     : $CORPUS_SIZE inputs"
   log "Coverage binary : $COV_BINARY"
   log "Runs            : $RUNS"
+  _stab_replay_text() {
+    if test "$STAB_INPROC" -eq 0; then
+      printf 'one process per execution'
+    elif test "$STAB_ROUNDS" -le 1; then
+      printf 'each input %d times in one process, the first run unrecorded' "$((RUNS + 1))"
+    else
+      printf 'each input in %d processes of %d runs, the first run of each unrecorded' \
+        "$STAB_ROUNDS" "$((RUNS / STAB_ROUNDS + 1))"
+    fi
+  }
+  log "Replay          : $(_stab_replay_text)"
   test -n "$SOURCE_FILTER" && log "Source filter   : $SOURCE_FILTER"
   test -n "$EXCLUDE_FILTER" && log "Exclude filter  : $EXCLUDE_FILTER"
 
@@ -1866,7 +2146,12 @@ cmd_stability() {
     read -r p_total p_ok p_failed p_killed p_unreadable <<< "$stats" || true
     logv "Pass $idx: $p_ok ok, $p_failed failed, $p_killed timed out (of $p_total)"
 
-    find "$run_dir" -maxdepth 1 -type f -name '*.profraw' -print \
+    _stab_collect_present "$idx"
+  }
+
+  _stab_collect_present() {
+    local idx="$1"
+    find "$STAB_DIR/run_${idx}" -maxdepth 1 -type f -name '*.profraw' -print \
       | "$GAWK" -F/ '{ n = $NF; sub(/-.*/, "", n); if (n ~ /^[0-9]+$/) print n }' \
       | sort -u > "$STAB_DIR/run_${idx}.present"
 
@@ -1875,6 +2160,43 @@ cmd_stability() {
       return 1
     fi
     return 0
+  }
+
+  _stab_replay_round() {
+    local first="$1" last="$2" idx count
+    local stats p_total=0 p_ok=0 p_failed=0 p_killed=0 p_unreadable=0
+    if test "$STAB_INPROC" -eq 0; then
+      for idx in $(seq "$first" "$last"); do
+        if _stab_replay_pass "$idx"; then
+          stab_replayed+=("$idx")
+        fi
+      done
+      return 0
+    fi
+
+    count=$((last - first + 1))
+    STAB_ROUNDS=$((STAB_ROUNDS + 1))
+    for idx in $(seq "$first" "$last"); do mkdir -p "$STAB_DIR/run_${idx}"; done
+    mkdir -p "$STAB_DIR/scratch"
+    log "Collecting passes $first-$last..."
+    export COV_REPEAT="$count" COV_REPEAT_FIRST="$first" COV_REPEAT_DIR="$STAB_DIR" \
+           COV_INPUT_TIMEOUT="$TIMEOUT"
+    export -f run_with_timeout command_for_input run_input_command \
+      run_input_command_unbounded record_slow_input replay_one_input \
+      replay_one_input_repeated
+    stats="$(xargs -0 -r -n 1 -P "$FORKS" \
+      bash -c 'replay_one_input_repeated "$1" "$2" "$3" "$4"' \
+      _ "$COVERAGE_CMD" "$(( (count + 1) * TIMEOUT ))" "$STAB_DIR/scratch" \
+      < "$STAB_DIR/inputs.manifest" 2>/dev/null | replay_tally 0 || true)"
+    unset COV_REPEAT COV_REPEAT_FIRST COV_REPEAT_DIR COV_INPUT_TIMEOUT
+    read -r p_total p_ok p_failed p_killed p_unreadable <<< "$stats" || true
+    logv "Passes $first-$last: $p_ok ok, $p_failed failed, $p_killed timed out (of $p_total)"
+
+    for idx in $(seq "$first" "$last"); do
+      if _stab_collect_present "$idx"; then
+        stab_replayed+=("$idx")
+      fi
+    done
   }
 
   # Restrict analysis to the inputs that produced coverage in EVERY analyzed
@@ -1954,11 +2276,7 @@ cmd_stability() {
   local stab_replayed=()
   local stab_passes=()
   local run_idx
-  for run_idx in $(seq 1 "$RUNS"); do
-    if _stab_replay_pass "$run_idx"; then
-      stab_replayed+=("$run_idx")
-    fi
-  done
+  _stab_replay_round 1 "$RUNS"
 
   log "Collected all data, analyzing ..."
 
@@ -2040,11 +2358,7 @@ cmd_stability() {
   if test -n "$unstable_lines" && test -z "$USER_RUNS"; then
     local extra_end=$((RUNS * 2))
     log "Instability detected, extending from $RUNS to $extra_end runs..."
-    for run_idx in $(seq $((RUNS + 1)) "$extra_end"); do
-      if _stab_replay_pass "$run_idx"; then
-        stab_replayed+=("$run_idx")
-      fi
-    done
+    _stab_replay_round $((RUNS + 1)) "$extra_end"
     RUNS="$extra_end"
 
     # The added passes can shrink the common input set, so every pass is
@@ -2141,6 +2455,7 @@ cmd_stability() {
       printf "Runs        : %d analyzed (%d of %d failed and were skipped)\n" \
         "${#stab_passes[@]}" "$((RUNS - ${#stab_passes[@]}))" "$RUNS"
     fi
+    printf "Replay      : %s\n" "$(_stab_replay_text)"
     printf "Stability   : %s (%d/%d executed lines stable)\n" \
       "$pct" "$stable_count" "$total_lines"
 
@@ -2277,8 +2592,8 @@ cmd_search() {
   esac
   if test -n "$FUZZER_LAYOUT"; then
     case "$FUZZER_LAYOUT" in
-      afl|flat) ;;
-      *) err "--layout must be 'afl' or 'flat' (got '$FUZZER_LAYOUT')"; exit 1 ;;
+      afl|libafl|flat) ;;
+      *) err "--layout must be 'afl', 'libafl' or 'flat' (got '$FUZZER_LAYOUT')"; exit 1 ;;
     esac
   fi
 
@@ -2312,10 +2627,11 @@ cmd_search() {
   case "$FUZZER_LAYOUT" in
     afl)  loge "Fuzzer layout   : AFL++ (queue/crashes/hangs)" ;;
     flat) loge "Fuzzer layout   : flat (libFuzzer/libafl/honggfuzz)" ;;
+    libafl) loge "Fuzzer layout   : LibAFL (corpus|queue, crashes|solutions)" ;;
     empty)
       err "No input files found in $AFL_DIR"
-      err "Expected one of: AFL++ out dir, libFuzzer/libafl corpus, honggfuzz workspace."
-      err "Override detection with --layout afl|flat if needed."
+      err "Expected one of: AFL++ or LibAFL output dir, libFuzzer/libafl corpus, honggfuzz workspace."
+      err "Override detection with --layout afl|libafl|flat if needed."
       exit 1 ;;
   esac
 
@@ -2341,7 +2657,8 @@ cmd_search() {
   # ── workspace ──────────────────────────────────────────────────────────────
   local SEARCH_DIR
   SEARCH_DIR="$(mktemp -d "$(tmp_base_dir)/cov-analysis-search.XXXXXX")"
-  trap "rm -rf '$SEARCH_DIR'" EXIT INT TERM
+  COV_REPORT_CLEAN_PROFRAW="$SEARCH_DIR"
+  install_cleanup_traps
 
   # ── union pre-check ────────────────────────────────────────────────────────
   loge "Union pre-check : replaying $TOTAL input(s) to test reachability..."
@@ -3787,8 +4104,7 @@ render_coverage_report() {
 run_remote_replay() {
   local host="$1" fetched="$2" opts="$3" remote_dir="$4"
   local script rd rc=0
-  local -a sshopts=()
-  test -n "$opts" && read -r -a sshopts <<< "$opts"
+  parse_ssh_opts "$opts" || return 1
 
   script="$(realpath -e -- "${BASH_SOURCE[0]}" 2>/dev/null)" || {
     err "Could not locate the cov-analysis script to copy to $host."
@@ -3797,13 +4113,13 @@ run_remote_replay() {
 
   if test -n "$remote_dir"; then
     rd="$remote_dir"
-    ssh ${sshopts[@]+"${sshopts[@]}"} "$host" \
+    ssh ${COV_REMOTE_SSHOPTS[@]+"${COV_REMOTE_SSHOPTS[@]}"} "$host" \
       "mkdir -p -- $(printf '%q' "$rd")" || {
       err "Could not create the remote working directory on $host: $rd"
       return 1
     }
   else
-    rd="$(ssh ${sshopts[@]+"${sshopts[@]}"} "$host" \
+    rd="$(ssh ${COV_REMOTE_SSHOPTS[@]+"${COV_REMOTE_SSHOPTS[@]}"} "$host" \
       'mktemp -d "${TMPDIR:-/tmp}/cov-analysis-remote.XXXXXX"')" || {
       err "Could not create a remote working directory on $host."
       return 1
@@ -3814,22 +4130,19 @@ run_remote_replay() {
     return 1
   fi
   logv "Remote work dir : $host:$rd"
-
-  _remote_cleanup() {
-    ssh ${sshopts[@]+"${sshopts[@]}"} "$host" \
-      "rm -rf -- $(printf '%q' "$rd")" >/dev/null 2>&1 || true
-  }
+  COV_REMOTE_HOST="$host"
+  COV_REMOTE_WORKDIR="$rd"
 
   log "Copying cov-analysis to $host..."
-  if ! scp ${sshopts[@]+"${sshopts[@]}"} "$script" \
+  if ! scp ${COV_REMOTE_SSHOPTS[@]+"${COV_REMOTE_SSHOPTS[@]}"} "$script" \
        "$host:$(printf '%q' "$rd/cov-analysis")"; then
     err "Could not copy cov-analysis to $host."
-    _remote_cleanup
+    remote_cleanup
     return 1
   fi
 
   local remote_cmd
-  remote_cmd="bash $(printf '%q' "$rd/cov-analysis") report"
+  remote_cmd="echo \$\$ > $(printf '%q' "$rd/pid") && exec bash $(printf '%q' "$rd/cov-analysis") report"
   remote_cmd="$remote_cmd -d $(printf '%q' "$AFL_DIR")"
   remote_cmd="$remote_cmd -e $(printf '%q' "$COVERAGE_CMD")"
   remote_cmd="$remote_cmd -o $(printf '%q' "$rd/out")"
@@ -3843,20 +4156,20 @@ run_remote_replay() {
   test "$VERBOSE" -eq 1 && remote_cmd="$remote_cmd -v"
 
   log "Replaying on $host..."
-  if ! ssh ${sshopts[@]+"${sshopts[@]}"} "$host" "$remote_cmd"; then
+  if ! ssh ${COV_REMOTE_SSHOPTS[@]+"${COV_REMOTE_SSHOPTS[@]}"} "$host" "$remote_cmd"; then
     err "Remote replay failed on $host."
-    _remote_cleanup
+    remote_cleanup
     return 1
   fi
 
   log "Fetching the merged profile from $host..."
-  if ! scp ${sshopts[@]+"${sshopts[@]}"} \
+  if ! scp ${COV_REMOTE_SSHOPTS[@]+"${COV_REMOTE_SSHOPTS[@]}"} \
        "$host:$(printf '%q' "$rd/out/coverage.profdata")" "$fetched"; then
     err "Could not fetch coverage.profdata from $host."
-    _remote_cleanup
+    remote_cleanup
     return 1
   fi
-  _remote_cleanup
+  remote_cleanup
   if ! test -s "$fetched"; then
     err "The profile fetched from $host is empty."
     return 1
@@ -4418,8 +4731,8 @@ cmd_report() {
   # Validate explicit --layout override if supplied
   if test -n "$FUZZER_LAYOUT"; then
     case "$FUZZER_LAYOUT" in
-      afl|flat) ;;
-      *) err "--layout must be 'afl' or 'flat' (got '$FUZZER_LAYOUT')"; exit 1 ;;
+      afl|libafl|flat) ;;
+      *) err "--layout must be 'afl', 'libafl' or 'flat' (got '$FUZZER_LAYOUT')"; exit 1 ;;
     esac
   fi
 
@@ -4538,10 +4851,11 @@ cmd_report() {
     case "$FUZZER_LAYOUT" in
       afl)  log "Fuzzer layout   : AFL++ (queue/crashes/hangs)" ;;
       flat) log "Fuzzer layout   : flat (libFuzzer/libafl/honggfuzz)" ;;
+      libafl) log "Fuzzer layout   : LibAFL (corpus|queue, crashes|solutions)" ;;
       empty)
         err "No input files found in $AFL_DIR"
-        err "Expected one of: AFL++ out dir, libFuzzer/libafl corpus, honggfuzz workspace."
-        err "Override detection with --layout afl|flat if needed."
+        err "Expected one of: AFL++ or LibAFL output dir, libFuzzer/libafl corpus, honggfuzz workspace."
+        err "Override detection with --layout afl|libafl|flat if needed."
         exit 1
         ;;
     esac
@@ -4606,6 +4920,11 @@ cmd_report() {
   if test "$RENDER_ONLY" -eq 0; then
   local QUEUE_COUNT
   QUEUE_COUNT=$(count_files find_queue_files)
+  if test "$QUEUE_COUNT" -eq 0 && test "$(count_files find_crash_timeout_files)" -eq 0; then
+    err "No input files found in $AFL_DIR for the $FUZZER_LAYOUT layout."
+    err "Override detection with --layout afl|libafl|flat if needed."
+    exit 1
+  fi
   log "Replaying $QUEUE_COUNT queue files..."
 
   local IS_DRIVER=0
@@ -4618,13 +4937,16 @@ cmd_report() {
   : > "$SLOW_LOG"
   export COV_TIMEOUT_LOG="$SLOW_LOG"
   export COV_INPUT_TIMEOUT="$QUEUE_TIMEOUT"
+  local FALLBACK_LOG="$PROFRAW_DIR/batch_fallback.txt"
+  : > "$FALLBACK_LOG"
 
   local BATCH_N
   BATCH_N="$(resolve_batch_size "$COVERAGE_CMD" "$IS_DRIVER" "$BATCH_SIZE")"
   if test "$BATCH_N" -gt 0 && test "$IS_DRIVER" -ne 1; then
     logw "Batching $BATCH_N inputs per process on a binary that is not a"
     logw "cov-analysis driver: it has no per-input alarm, so one input that does"
-    logw "not terminate costs the whole batch its coverage at the deadline."
+    logw "not terminate holds its batch until the batch deadline, after which the"
+    logw "batch is replayed one input per process."
   elif test "$BATCH_N" -eq 0 && test -z "$BATCH_SIZE" &&
        test "${COVERAGE_CMD##* }" = "@@"; then
     logw "Replaying one input per process: $COV_BINARY carries no cov-analysis"
@@ -4637,17 +4959,22 @@ cmd_report() {
       if test "$BATCH_N" -gt 0; then
         # Fast batch: strip trailing @@ and let xargs append all files at once.
         # bash -c handles the same shell language as every other replay mode.
-        # Each batch profiles under its own prefix (so a reused PID cannot make
-        # one batch overwrite another's profile) and reports its exit status
-        # and size for the replay tally.
-        local CMD_NO_AT="${COVERAGE_CMD% @@}"
+        # Each batch profiles into its own directory (so a reused PID cannot
+        # make one batch overwrite another's profile) and reports its exit
+        # status and size for the replay tally, or one status per input when
+        # it had to be replayed one input per process.
+        local CMD_NO_AT="${COVERAGE_CMD% @@}" BATCH_CAP=0
+        test "$IS_DRIVER" -eq 1 || BATCH_CAP="$BATCH_DEADLINE_INPUTS"
         logv "Queue replay: batch of $BATCH_N (xargs, workers=$FORKS)"
         export COV_PROFRAW_DIR="$PROFRAW_DIR" COV_CMD="$CMD_NO_AT" \
-               COV_QUEUE_TIMEOUT="$QUEUE_TIMEOUT"
-        export -f run_with_timeout replay_batch
+               COV_QUEUE_TIMEOUT="$QUEUE_TIMEOUT" COV_BATCH_CAP="$BATCH_CAP" \
+               COV_BATCH_FALLBACK_LOG="$FALLBACK_LOG"
+        export -f run_with_timeout command_for_input run_input_command \
+          run_input_command_unbounded record_slow_input replay_one_input \
+          replay_batch
         # shellcheck disable=SC2016
         QUEUE_STATS="$(find_queue_files | xargs -0 -r -n "$BATCH_N" -P "$FORKS" \
-          bash -c 'replay_batch "$COV_CMD" "$COV_QUEUE_TIMEOUT" "$COV_PROFRAW_DIR" "$@"' -- \
+          bash -c 'replay_batch "$COV_CMD" "$COV_QUEUE_TIMEOUT" "$COV_BATCH_CAP" "$COV_PROFRAW_DIR" "$@"' -- \
           | replay_tally "$IS_DRIVER" "$QUEUE_COUNT" "queue files" || true)"
       else
         # One input per process: @@ is embedded mid-command (e.g.
@@ -4674,6 +5001,16 @@ cmd_report() {
   local Q_TOTAL=0 Q_OK=0 Q_FAILED=0 Q_KILLED=0 Q_UNREADABLE=0
   read -r Q_TOTAL Q_OK Q_FAILED Q_KILLED Q_UNREADABLE <<< "$QUEUE_STATS" || true
   log "Queue replay   : $Q_OK ok, $Q_FAILED failed, $Q_KILLED timed out (of $Q_TOTAL)"
+  if test -s "$FALLBACK_LOG"; then
+    local FB_BATCHES FB_TOTAL
+    FB_BATCHES=$(grep -c . "$FALLBACK_LOG")
+    FB_TOTAL=$(( (QUEUE_COUNT + BATCH_N - 1) / BATCH_N ))
+    log "Batch fallback : $FB_BATCHES of $FB_TOTAL batches failed as a whole and were replayed one input per process"
+    if test "$FB_TOTAL" -ge 4 && test $((FB_BATCHES * 2)) -gt "$FB_TOTAL"; then
+      logw "Most batches failed as a whole, so most inputs ran twice. If the target"
+      logw "exits non-zero for inputs it rejects, --batch 0 runs each input once."
+    fi
+  fi
 
   if test "$Q_UNREADABLE" -gt 0; then
     err "The coverage driver could not read $Q_UNREADABLE of $Q_TOTAL queue inputs."

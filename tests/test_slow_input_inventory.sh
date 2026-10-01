@@ -117,11 +117,11 @@ out=$(PATH="$TOOLS:/usr/bin:/bin" timeout 120 bash "$ROOT/cov-analysis" report \
 assert_eq "$?" "0" "batch replay with a hanging input must publish: $out"
 grep -qxF "$HANG_INPUT" "$TMP/rep/slow_inputs.txt" \
   || die "batch mode did not name the input that hung: $(cat "$TMP/rep/slow_inputs.txt" 2>/dev/null)"
-# The rest of the batch must survive: the driver jumps past the hung input
-# rather than the whole batch being killed and losing its profile. So the batch
-# reports success for all three inputs and the inventory carries the one that
-# was skipped.
-printf '%s\n' "$out" | grep -q 'Queue replay *: 3 ok, 0 failed, 0 timed out' \
+# The rest of the batch must survive: the driver ends the batch at the hung
+# input and the batch is replayed one input per process. So the other inputs
+# report success, only the hung one counts as timed out, and the inventory
+# carries it.
+printf '%s\n' "$out" | grep -q 'Queue replay *: 2 ok, 0 failed, 1 timed out' \
   || die "the batch must complete around the input that hung: $out"
 test -s "$TMP/rep/coverage.profdata" || die "the batch lost its profile"
 echo "[PASS] batch mode names the input it killed"

@@ -181,4 +181,89 @@ compgen -G "$TMP/work/.rep.cov-analysis.stage.*" >/dev/null \
 test -d "$LOCK" && die "a hung-up run left its lock behind"
 echo "[PASS] HUP cleans up like INT and TERM"
 
+race_for_lock() {
+  local i
+  rm -f "$TMP/winners" "$TMP/finished" "$TMP/release"
+  : > "$TMP/winners"
+  : > "$TMP/finished"
+  for _ in $(seq 1 40); do
+    bash -c '
+      cd "$1"
+      source ./cov-analysis
+      set +e
+      if acquire_report_lock "$2" rep 0 >/dev/null 2>&1; then
+        echo "$$" >> "$3"
+        echo x >> "$4"
+        while ! test -e "$5"; do sleep 0.1; done
+      else
+        echo x >> "$4"
+      fi
+    ' _ "$ROOT" "$TMP/work" "$TMP/winners" "$TMP/finished" "$TMP/release" &
+  done
+  for i in $(seq 1 300); do
+    test "$(grep -c . "$TMP/finished")" -ge 40 && break
+    sleep 0.1
+  done
+  : > "$TMP/release"
+  wait
+}
+
+rm -rf "$LOCK"
+race_for_lock
+assert_eq "$(grep -c . "$TMP/winners")" "1" \
+  "exactly one of 40 concurrent runs may take the lock"
+compgen -G "$TMP/work/.rep.cov-analysis.lock.*" >/dev/null \
+  && die "a lock attempt left a temporary lock directory behind"
+echo "[PASS] concurrent runs never share a lock"
+
+true &
+DEAD=$!
+wait "$DEAD"
+for round in 1 2 3; do
+  rm -rf "$LOCK"
+  mkdir -p "$LOCK"
+  {
+    printf 'pid %s\n' "$DEAD"
+    printf 'started %s\n' "12345"
+    printf 'host %s\n' "$(this_host)"
+  } > "$LOCK/owner"
+  race_for_lock
+  assert_eq "$(grep -c . "$TMP/winners")" "1" \
+    "exactly one of 40 concurrent runs may take over a stale lock (round $round)"
+  compgen -G "$TMP/work/.rep.cov-analysis.lock.*" >/dev/null \
+    && die "a takeover left a temporary lock directory behind: $(ls -a "$TMP/work")"
+done
+echo "[PASS] concurrent runs never share a lock they took over"
+
+rm -rf "$LOCK"
+mkdir -p "$LOCK.takeover" "$LOCK"
+: > "$LOCK/owner"
+out=$(run_report)
+test "$?" -ne 0 || die "a run must not take over a lock while the takeover guard is held"
+printf '%s\n' "$out" | grep -q -- '--clean' \
+  || die "a run blocked by a stale takeover guard must point at --clean: $out"
+out=$(PATH="$TOOLS:/usr/bin:/bin" bash "$ROOT/cov-analysis" report -o "$REP" --clean 2>&1)
+assert_eq "$?" "0" "--clean failed: $out"
+test -d "$LOCK.takeover" && die "--clean left a stale takeover guard behind"
+out=$(run_report)
+assert_eq "$?" "0" "a run after --clean must take the lock: $out"
+echo "[PASS] --clean removes a stale takeover guard"
+
+rm -rf "$LOCK"
+mkdir -p "$TMP/work/.rep.cov-analysis.lock.new.STALE"
+out=$(PATH="$TOOLS:/usr/bin:/bin" bash "$ROOT/cov-analysis" report -o "$REP" --clean 2>&1)
+assert_eq "$?" "0" "--clean failed: $out"
+test -d "$TMP/work/.rep.cov-analysis.lock.new.STALE" \
+  && die "--clean left a half-built lock behind"
+echo "[PASS] --clean removes a half-built lock"
+
+for mask in 022 027; do
+  rm -rf "$LOCK"
+  mode=$(umask "$mask"; acquire_report_lock "$TMP/work" rep 0 >/dev/null 2>&1 && stat -c %a "$LOCK")
+  expected=$(umask "$mask"; mkdir "$TMP/modecheck" && stat -c %a "$TMP/modecheck"; rmdir "$TMP/modecheck")
+  assert_eq "$mode" "$expected" "the lock must get the mode mkdir gives under umask $mask"
+done
+rm -rf "$LOCK"
+echo "[PASS] other users can read who holds the lock"
+
 echo "[PASS] test_report_lock"

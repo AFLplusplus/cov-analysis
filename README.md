@@ -29,7 +29,7 @@ Version: 1.3-dev
 
 ## Introduction
 
-`cov-analysis` generates **LLVM source-based code coverage** reports from a fuzzing corpus. It auto-detects the on-disk layout used by [AFL++](https://github.com/AFLplusplus/AFLplusplus) (queue/crashes/timeouts directories, single or parallel), libFuzzer and libafl (flat corpus dir plus `crash-*`/`leak-*`/`oom-*` artifacts), and honggfuzz (flat corpus plus `SIG*.fuzz` crash files). It replays each input through a coverage-instrumented binary, merges the raw profiles, and produces HTML, text, and JSON reports via `llvm-profdata` and `llvm-cov`.
+`cov-analysis` generates **LLVM source-based code coverage** reports from a fuzzing corpus. It auto-detects the on-disk layout used by [AFL++](https://github.com/AFLplusplus/AFLplusplus) (queue/crashes/timeouts directories, single or parallel), LibAFL (`corpus/` or `queue/` next to `crashes/` or `solutions/`), libFuzzer and libafl's libFuzzer mode (flat corpus dir plus `crash-*`/`leak-*`/`oom-*` artifacts), and honggfuzz (flat corpus plus `SIG*.fuzz` crash files). It replays each input through a coverage-instrumented binary, merges the raw profiles, and produces HTML, text, and JSON reports via `llvm-profdata` and `llvm-cov`.
 
 This is a rewrite of the original cov-analysis. Key changes in 1.0:
 - New: diff reports comparing coverage between two runs
@@ -62,14 +62,17 @@ The coverage reports can be augmented with harness reachability information from
 
 | Fuzzer     | Detected by                                | Input files replayed                                                          |
 |------------|--------------------------------------------|-------------------------------------------------------------------------------|
-| AFL++      | queue/crashes/timeouts under `<dir>` or a worker | `queue/id:*`, `crashes/id:*`, `hangs/id:*`                            |
-| libFuzzer  | flat directory of files, no `queue/`       | all files except `crash-*`/`leak-*`/`oom-*`/`timeout-*`/`slow-unit-*`        |
-| libafl     | flat directory of files, no `queue/`       | all files except `crash-*`/`leak-*`/`oom-*`/`timeout-*`/`slow-unit-*`        |
-| honggfuzz  | flat directory of files, no `queue/`       | all files except `SIG*.fuzz` and `HONGGFUZZ.REPORT.TXT`                       |
+| AFL++      | queue/crashes/hangs holding `id:*` entries (or a `fuzzer_stats`) under `<dir>` or a worker | `queue/id:*`, `crashes/id:*`, `hangs/id:*` |
+| LibAFL     | `corpus/` or `queue/` without `id:*` entries, beside `crashes/`/`solutions/` or with no files beside them; or only `crashes/`/`solutions/` | all files in `corpus/` and `queue/`; `crashes/` and `solutions/` as crashes |
+| libFuzzer  | flat directory of files                    | all files except `crash-*`/`leak-*`/`oom-*`/`timeout-*`/`slow-unit-*`        |
+| libafl (libFuzzer mode) | flat directory of files       | all files except `crash-*`/`leak-*`/`oom-*`/`timeout-*`/`slow-unit-*`        |
+| honggfuzz  | flat directory of files                    | all files except `SIG*.fuzz` and `HONGGFUZZ.REPORT.TXT`                       |
 
-Only regular files are selected. Directories and symlinks are never counted or
-replayed. For libFuzzer, libafl and honggfuzz, crash-like files are replayed
-under the `-T` hard deadline so a hanging input cannot stall the run.
+Only regular files are selected. Directories, symlinks, and hidden files (such
+as LibAFL's `.<id>.metadata` and `.<id>.lafl_lock`) are never counted or
+replayed. For LibAFL, libFuzzer, libafl and honggfuzz, crash-like files are
+replayed under the `-T` hard deadline so a hanging input cannot stall the run.
+A layout that selects no input at all is reported as such.
 
 Queue and corpus inputs have their own deadline, `--queue-timeout`. Its default
 is derived from the campaign: the largest `slowest_exec_ms` across the AFL++
@@ -88,7 +91,7 @@ publish a report when more of the queue failed than `--max-replay-failures`
 allows — a target that never processed its inputs produces a wrong number, not
 a low one.
 
-Override auto-detection with `--layout afl|flat`.
+Override auto-detection with `--layout afl|libafl|flat`.
 
 ## Workflow
 
@@ -136,7 +139,8 @@ The driver loops over all file arguments, calls `LLVMFuzzerTestOneInput` for
 each, and installs a crash handler that attempts to flush profiling data before
 re-raising the original signal. This is best effort:
 `__llvm_profile_write_file()` is not async-signal-safe and can fail after severe
-memory corruption.
+memory corruption. Under `cov-analysis stability` the driver also runs each
+input several times in one process and writes one profile per run (see Step 4).
 
 ### Step 2: Generate Coverage Report
 
@@ -192,10 +196,12 @@ ranked by their *reachable* uncovered regions.
 
 Report publication is transactional. All artifacts are generated and validated
 in a sibling staging directory on the same filesystem, including optional
-reachable-only metrics and annotations. The prior report is moved aside only
-for the final rename and is restored if publication fails. A second successful
-run copies the prior `coverage.json` into the staged report as
-`coverage_old.json`.
+reachable-only metrics and annotations. Where `mv --exchange` is available
+(GNU coreutils 9.5 and later, current uutils coreutils) the staged report and
+the prior one swap places in one atomic step, so the report directory never
+goes missing. Elsewhere the prior report is moved aside only for the final
+rename and is restored if publication fails. A second successful run copies the
+prior `coverage.json` into the staged report as `coverage_old.json`.
 
 A non-empty output directory is replaceable only when it contains the
 `.cov-analysis-report` ownership marker. New and empty destinations are allowed.
@@ -241,9 +247,17 @@ cov-analysis -d /path/to/libfuzzer-corpus/ -e "./fuzzer @@" --binary ./fuzzer \
              --batch 128
 ```
 
-Because a libFuzzer binary has no per-input alarm, an input that does not
-terminate costs its whole batch the coverage when the deadline kills it. Re-run
-with `--batch 0` to isolate one, guided by `<-o>/slow_inputs.txt`.
+A batch that crashes, exits non-zero, or is killed at its deadline is discarded
+and its inputs are replayed one per process, so one bad input costs no other
+input its coverage and only the bad input is counted as failed or timed out.
+The run reports how many batches were replayed this way. When most were, as
+with a target that exits non-zero for every input it rejects, `--batch 0` is
+faster: each input then runs once instead of twice.
+A cov-analysis driver ends its batch as soon as one input exceeds the queue
+timeout. Because a libFuzzer binary has no per-input alarm, an input that does
+not terminate holds its batch until the batch deadline (the queue timeout times
+the batch size, but at most 10 times the queue timeout) before that happens. The
+input is then named in `<-o>/slow_inputs.txt`.
 
 If your libFuzzer run used `-artifact_prefix=./crashes/`, point a second run at
 that directory to cover crash inputs too — or move artifacts into the corpus dir
@@ -396,8 +410,11 @@ cov-analysis --remote fuzzbox -d /fuzz/out -e "/fuzz/cov @@" \
 
 `-d` and `-e` are paths on the remote host; `--binary` is the matching local
 binary used for rendering, and `-o` is required. Only `coverage.profdata` comes
-back — never the corpus. The remote working directory is removed on success and
-on failure. Pass ssh/scp options with `--ssh-opts "-o Port=2222"`.
+back — never the corpus. The remote working directory is removed however the
+run ends; a replay still running on the remote host after Ctrl-C or a dropped
+connection is stopped first. Pass ssh/scp options with
+`--ssh-opts "-o Port=2222"`; quote a value that contains spaces, as in
+`--ssh-opts "-o 'IdentityFile=/keys/fuzz key'"`.
 
 `--profdata` is also how you re-render an existing report with a different
 `--ignore-regex` or fresh `--reachability` data, without replaying anything.
@@ -466,6 +483,20 @@ cov-analysis stability -d ../afl/out -e "./cov @@"
 cov-analysis stability -d ../afl/out -e "./cov @@" -T 2
 ```
 
+A binary built with the cov-analysis driver runs each input N+1 times in a row
+in one process (`-n`, default 4) and records every run but the first, which is
+how AFL++ calibrates an input in persistent mode. State the harness carries
+from one execution to the next — a static counter, a cache, a buffer that grows
+— is the most common cause of the instability AFL++ reports, and it shows up
+here as varying hit counts. One-time initialization happens in the unrecorded
+first run, so a lazily allocated table is not reported. A binary that is not a
+cov-analysis driver, or a driver built before this mode existed, runs every
+execution in a fresh process; that measures per-input determinism only and
+cannot see state carried between executions. `--isolated` selects it for a
+driver binary too. When instability extends the default 4 passes to 8, the
+added passes come from a second process per input, again after an unrecorded
+first run. The report's `Replay` line says which replay ran.
+
 The denominator is the union of source lines executed at least once across all
 successful passes. Lines that are zero or absent in every pass are excluded;
 a zero/absent-to-positive transition is included and classified unstable. If no
@@ -493,18 +524,16 @@ Stability Report
 --------------------------------------------------------
 Corpus size : 2 inputs
 Runs        : 8
-Stability   : 74.0% (91/123 executed lines stable)
+Replay      : each input in 2 processes of 5 runs, the first run of each unrecorded
+Stability   : 46.8% (36/77 executed lines stable)
 
-~~ Variable-count lines (32 lines):
+~~ Variable-count lines (41 lines):
    Lines with varying hit counts:
 
-  /prg/cov-analysis/tests/unstable.c:35-37
-  /prg/cov-analysis/tests/unstable.c:43
-  /prg/cov-analysis/tests/unstable.c:46-48
-  /prg/cov-analysis/tests/unstable.c:51-52
+  /prg/cov-analysis/tests/unstable.c:35-43
+  /prg/cov-analysis/tests/unstable.c:46-52
   /prg/cov-analysis/tests/unstable.c:55-61
-  /prg/cov-analysis/tests/unstable.c:64-66
-  /prg/cov-analysis/tests/unstable.c:69-70
+  /prg/cov-analysis/tests/unstable.c:64-70
   /prg/cov-analysis/tests/unstable.c:75-85
 
 [!] Unstable coverage detected.
@@ -590,13 +619,16 @@ Optional:
                      input otherwise pays for. Needs a coverage command ending
                      in @@ and a target that takes several input files on argv.
                      Default: 128 for a cov-analysis driver binary, one input
-                     per process otherwise; 0 or 1 forces one per process
+                     per process otherwise; 0 or 1 forces one per process. A
+                     batch that fails or is killed is replayed one input per
+                     process
   --force            Take over a report directory another run holds
   --clean            Remove the lock and staging directories of <-o> that no
                      running cov-analysis holds, then exit
   --binary <path>    Instrumented binary for LLVM and driver detection;
                      required when -e has quoted paths, wrappers, or shell syntax
-  --layout <kind>    Force layout: 'afl' or 'flat' (default: auto-detect)
+  --layout <kind>    Force layout: 'afl', 'libafl' or 'flat' (default:
+                     auto-detect)
   --max-replay-failures <pct>
                      Fail the run when more than <pct> percent of the queue
                      inputs did not replay cleanly (default: 99). Crash and
@@ -620,7 +652,8 @@ Optional:
   --name <name>      Directory name for the campaign started by the last -d
   --remote <host>    Replay on [user@]host and fetch only the merged profile;
                      -d/-e are remote paths, --binary is the local binary
-  --ssh-opts <opts>  Options for ssh and scp, e.g. "-o Port=2222"
+  --ssh-opts <opts>  Options for ssh and scp, e.g. "-o Port=2222"; quote
+                     values that contain spaces
   --remote-dir <dir> Remote working directory (default: remote mktemp -d)
   --migrate-existing-report
                      Explicitly replace a complete pre-marker report after a
@@ -657,6 +690,14 @@ Usage: cov-analysis driver [-o output.c]
   inputs are reported on stderr and make the driver exit 2; empty inputs are
   reported but are not an error.
 
+  With COV_INPUT_TIMEOUT=<secs> set, an input that runs longer is named on
+  stderr and the driver exits at once with status 124; cov-analysis replays
+  the rest of that batch one input per process.
+
+  Under cov-analysis stability the driver runs each input several times in
+  one process and writes one profile per run (COV_REPEAT), so the analysis
+  sees state the harness carries between executions.
+
 Options:
   -o <file>     Write driver source to FILE instead of stdout
 ```
@@ -689,6 +730,12 @@ Usage: cov-analysis stability [options]
   Reports a stability percentage. If instability is found with the default
   4 runs, reruns for a total of 8 to confirm.
 
+  A cov-analysis driver binary runs each input N+1 times in a row in one
+  process and records every run but the first, the way AFL++ calibrates an
+  input in persistent mode, so state carried between executions shows up as
+  instability. Other binaries, older drivers, and --isolated run every
+  execution in a fresh process.
+
   Resilient to flaky passes: a pass whose profiles cannot be collected or
   merged (e.g. a crashing input that left a truncated .profraw behind) is
   skipped and the run continues with the remaining passes, as long as at
@@ -716,19 +763,23 @@ Optional:
   -t <num>           Parallel replay workers (default: 1)
   -T <secs>          Per-input timeout in seconds (default: 5)
   --binary <path>    Instrumented binary for ambiguous -e shell commands
-  --layout <kind>    Force layout: 'afl' or 'flat' (default: auto-detect)
+  --isolated         Run every execution in a fresh process, also for a
+                     cov-analysis driver binary
+  --layout <kind>    Force layout: 'afl', 'libafl' or 'flat' (default:
+                     auto-detect)
   -v                 Verbose output
   -q                 Quiet mode (suppress all [+] output)
   -V                 Print version and exit
   -h, --help         Print this help and exit
 ```
 
-The command outputs a **Stability Report** showing corpus size, number of runs, and the stability percentage (stable executed lines / total executed lines). If unstable lines are found, they are listed with file paths and line number ranges. If any pass failed to collect or merge its profiles, it is skipped and the report notes how many runs were actually analyzed. If inputs were excluded because they did not produce coverage in every pass, the report adds an `Inputs used` line.
+The command outputs a **Stability Report** showing corpus size, number of runs, how inputs were replayed, and the stability percentage (stable executed lines / total executed lines). If unstable lines are found, they are listed with file paths and line number ranges. If any pass failed to collect or merge its profiles, it is skipped and the report notes how many runs were actually analyzed. If inputs were excluded because they did not produce coverage in every pass, the report adds an `Inputs used` line.
 
 Examples:
 
 ```bash
 cov-analysis stability -d out/ -e "./cov @@"
+cov-analysis stability -d out/ -e "./cov @@" --isolated
 cov-analysis stability -d out/ -e "./cov @@" -n 8 -s src/
 cov-analysis stability -d out/ -e "./cov @@" --exclude-regex '\.h$'
 cov-analysis stability -d ./corpus -e "./cov @@" -t 4
@@ -759,7 +810,8 @@ Optional:
   -T <secs>          Per-input replay timeout in seconds (default: 5)
                      Applies in both union and isolated replay
   --binary <path>    Instrumented binary for ambiguous -e shell commands
-  --layout <kind>    Force layout: 'afl' or 'flat' (default: auto-detect)
+  --layout <kind>    Force layout: 'afl', 'libafl' or 'flat' (default:
+                     auto-detect)
   -v                 Verbose output
   -q                 Quiet mode
   -V                 Print version and exit

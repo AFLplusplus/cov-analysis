@@ -131,15 +131,12 @@ mkdir "$MVTOOLS"
 cat > "$MVTOOLS/mv" <<'EOF'
 #!/bin/bash
 test "${1:-}" = --version && exec /usr/bin/mv "$@"
-n=0
-test -f "$MV_COUNT" && n=$(cat "$MV_COUNT")
-n=$((n + 1))
-printf '%s' "$n" > "$MV_COUNT"
-test "$n" -eq 2 && exit 88
+for arg in "$@"; do
+  case "$arg" in *.cov-analysis.stage.*) exit 88 ;; esac
+done
 exec /usr/bin/mv "$@"
 EOF
 chmod +x "$MVTOOLS/mv"
-export MV_COUNT="$TMP/mv-count"
 if PATH="$MVTOOLS:$PATH" EXPORT_TAG=publish-fail report "$DEST" >"$TMP/publish.log" 2>&1; then
   die "publication rename failure should return nonzero"
 fi
@@ -169,5 +166,35 @@ ln -s "$TMP/symlink-target" "$TMP/symlink-report"
 EXPORT_TAG=symlink report "$TMP/symlink-report" || die "symlink destination failed"
 test -L "$TMP/symlink-report" || die "report destination symlink was replaced"
 test -f "$TMP/symlink-target/.cov-analysis-report" || die "symlink target report marker missing"
+
+mkdir -p "$TMP/xchg/a" "$TMP/xchg/b"
+if mv --exchange -T -- "$TMP/xchg/a" "$TMP/xchg/b" 2>/dev/null; then
+  (
+    source ./cov-analysis
+    set +e
+    PUB="$TMP/pub"
+    mkdir -p "$PUB/report"
+    printf 'cov-analysis-report-v1\n' > "$PUB/report/.cov-analysis-report"
+    ( while :; do test -e "$PUB/report/.cov-analysis-report" || echo gap; done ) > "$TMP/gaps" &
+    POLL=$!
+    for i in $(seq 1 200); do
+      stage="$PUB/.report.cov-analysis.stage.$i"
+      mkdir "$stage"
+      printf 'cov-analysis-report-v1\n' > "$stage/.cov-analysis-report"
+      printf '%s\n' "$i" > "$stage/generation"
+      publish_report "$stage" "$PUB/report" || { kill "$POLL"; die "publication $i failed"; }
+    done
+    kill "$POLL"
+    wait "$POLL" 2>/dev/null
+    test -s "$TMP/gaps" && die "the published report disappeared during publication"
+    assert_eq "$(cat "$PUB/report/generation")" "200" "the last publication must win"
+    compgen -G "$PUB/.report.cov-analysis.*" >/dev/null \
+      && die "publication left a directory behind: $(ls -a "$PUB")"
+    exit 0
+  ) || exit 1
+  echo "[PASS] publication replaces the report in one atomic step"
+else
+  echo "[SKIP] atomic publication (mv --exchange unavailable)"
+fi
 
 echo "[PASS] test_report_transaction"

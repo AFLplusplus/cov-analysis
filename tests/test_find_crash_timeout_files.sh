@@ -32,4 +32,12 @@ AFL_DIR="$TMP/honggfuzz"; mkfixture_honggfuzz "$AFL_DIR"
 FUZZER_LAYOUT="flat"
 find_crash_timeout_files | assert_count 2 "honggfuzz crashes"
 
+AFL_DIR="$TMP/libafl"; mkfixture_libafl "$AFL_DIR"
+FUZZER_LAYOUT="libafl"
+find_crash_timeout_files | assert_count 1 "libafl crashes"
+
+AFL_DIR="$TMP/libafl-queue"; mkfixture_libafl_queue "$AFL_DIR"
+FUZZER_LAYOUT="libafl"
+find_crash_timeout_files | assert_count 1 "libafl solutions"
+
 echo "[PASS] find_crash_timeout_files"

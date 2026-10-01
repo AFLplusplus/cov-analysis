@@ -100,8 +100,9 @@ printf '%s\n' "$out" | grep -q 'empty input' \
   || die "driver did not report the empty input: $out"
 
 # A batch is one process, so an outer timeout can only kill the whole batch.
-# The driver's own per-input alarm must name the input that hung, carry on with
-# the rest of the batch, and leave the exit status alone.
+# The driver's own per-input alarm must name the input that hung and end the
+# process at once with status 124, without running anything else in it: the
+# harness may have been stopped while holding a lock.
 cat > "$TMP/harness_hang.c" <<'EOF'
 #include <stddef.h>
 #include <unistd.h>
@@ -122,22 +123,44 @@ out=$(COV_INPUT_TIMEOUT=1 COV_TIMEOUT_LOG="$TMP/slow.txt" \
   LLVM_PROFILE_FILE="$TMP/hang.profraw" timeout 60 "$TMP/cov3" \
   "$TMP/in1" "$TMP/in2" "$TMP/in3" 2>&1)
 rc=$?
-assert_eq "$rc" "0" "a timed-out input must not change the driver's exit status: $out"
+assert_eq "$rc" "124" "a timed-out input must end the driver with status 124: $out"
 printf '%s\n' "$out" | grep -q "timeout after 1s: $TMP/in2" \
   || die "the driver did not name the input that hung: $out"
 n=$(printf '%s\n' "$out" | grep -c '^Running: ')
-assert_eq "$n" "3" "the driver must carry on with the rest of the batch: $out"
+assert_eq "$n" "2" "the driver must not run another input after a timeout: $out"
 assert_eq "$(cat "$TMP/slow.txt")" "$TMP/in2" "the driver did not log the input that hung"
-test -s "$TMP/hang.profraw" || die "a batch with a timed-out input wrote no profile"
-"$PROFDATA" merge -sparse "$TMP/hang.profraw" -o "$TMP/hang.profdata" \
-  || die "the profile written after a per-input timeout is invalid"
+test -s "$TMP/hang.profraw" \
+  && die "the driver must not run the profile writer after a per-input timeout"
 echo "[PASS] per-input deadline inside a batch"
 
 # Without COV_INPUT_TIMEOUT nothing is armed and no alarm interferes.
 out=$(LLVM_PROFILE_FILE="$TMP/noalarm.profraw" "$TMP/cov3" "$TMP/in1" "$TMP/in3" 2>&1)
 assert_eq "$?" "0" "the driver must run unbounded without COV_INPUT_TIMEOUT: $out"
-printf '%s\n' "$out" | grep -q '0 timed out' \
-  || die "an unbounded run must report no timeouts: $out"
+n=$(printf '%s\n' "$out" | grep -c '^Running: ')
+assert_eq "$n" "2" "an unbounded run must replay every input: $out"
+
+cat > "$TMP/harness_spin.c" <<'EOF'
+#include <stddef.h>
+static volatile int sink;
+int LLVMFuzzerTestOneInput(const unsigned char *data, size_t size) {
+  if (size > 0 && data[0] == 'H') { for (;;) sink++; }
+  return 0;
+}
+EOF
+"$CLANG" -fprofile-instr-generate -fcoverage-mapping "$DRIVER" "$TMP/harness_spin.c" \
+  -o "$TMP/cov4" || die "spinning harness compilation failed"
+kept=0
+for _ in $(seq 1 10); do
+  rm -f "$TMP/term.profraw" "$TMP/term.profdata"
+  LLVM_PROFILE_FILE="$TMP/term.profraw" timeout --signal=TERM --kill-after=5s 0.3s \
+    "$TMP/cov4" "$TMP/in2" >/dev/null 2>&1
+  if test -s "$TMP/term.profraw" \
+     && "$PROFDATA" merge -sparse "$TMP/term.profraw" -o "$TMP/term.profdata" >/dev/null 2>&1; then
+    kept=$((kept + 1))
+  fi
+done
+assert_eq "$kept" "10" "an input stopped by timeout's TERM must keep its profile every time"
+echo "[PASS] TERM from timeout keeps the profile of the input it stops"
 
 # LLVM_PROFILE_FILE keeps the profiling runtime from dropping a default.profraw
 # into the repository at exit.

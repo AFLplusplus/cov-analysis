@@ -16,7 +16,8 @@ ROOT="$PWD"
 source tests/lib.sh
 
 TMP=$(mktmp)
-trap 'rm -rf "$TMP"' EXIT
+JOB=""
+trap 'test -n "$JOB" && kill -KILL -- -"$JOB" 2>/dev/null; pkill -f -- "$TMP/remote/" 2>/dev/null; rm -rf "$TMP"' EXIT
 TOOLS="$TMP/tools"
 CORPUS="$TMP/corpus"
 mkdir -p "$TOOLS" "$CORPUS"
@@ -77,7 +78,18 @@ while test $# -gt 0; do
   esac
 done
 test "$host" = "$EXPECT_HOST" || { echo "unexpected host: $host" >&2; exit 255; }
-bash -c "$*"
+case "${SSH_DROP:-}:$*" in
+  1:*--replay-only*)
+    setsid -f sh -c "$*" >/dev/null 2>&1
+    sleep 1
+    exit 255 ;;
+esac
+if test "$*" = "bash -s"; then
+  script=$(cat)
+  printf '%s\n' "$script" >> "$SSH_LOG"
+  exec setsid -f -w sh -c "$*" <<< "$script"
+fi
+exec setsid -f -w sh -c "$*"
 EOF
 cat > "$TOOLS/scp" <<'EOF'
 #!/bin/bash
@@ -135,6 +147,26 @@ grep -q '\[-o\] \[Port=2222\]' "$SSH_LOG" \
   || die "--ssh-opts was not passed to ssh: $(cat "$SSH_LOG")"
 echo "[PASS] --ssh-opts reaches ssh and scp"
 
+: > "$SSH_LOG"
+bash ./cov-analysis report --remote fuzzbox \
+  --ssh-opts "-o Port=2222 -o 'IdentityFile=$TMP/my key'" -d "$CORPUS" \
+  -e "$TMP/target @@" --binary "$TMP/target" -o "$TMP/report6" -q \
+  >"$TMP/quoted.log" 2>&1 || die "remote report with quoted --ssh-opts failed: $(cat "$TMP/quoted.log")"
+grep '^ssh' "$SSH_LOG" | grep -qF "[-o] [IdentityFile=$TMP/my key]" \
+  || die "a quoted --ssh-opts value was split for ssh: $(cat "$SSH_LOG")"
+grep '^scp' "$SSH_LOG" | grep -qF "[-o] [IdentityFile=$TMP/my key]" \
+  || die "a quoted --ssh-opts value was split for scp: $(cat "$SSH_LOG")"
+: > "$SSH_LOG"
+if bash ./cov-analysis report --remote fuzzbox --ssh-opts "-o 'Port=2222" -d "$CORPUS" \
+     -e "$TMP/target @@" --binary "$TMP/target" -o "$TMP/report8" -q \
+     >"$TMP/unbalanced.log" 2>&1; then
+  die "--ssh-opts with an unbalanced quote must be refused"
+fi
+grep -q 'ssh-opts' "$TMP/unbalanced.log" \
+  || die "the refusal must name --ssh-opts: $(cat "$TMP/unbalanced.log")"
+test -s "$SSH_LOG" && die "nothing may reach the remote host with unusable --ssh-opts"
+echo "[PASS] --ssh-opts keeps quoted values together"
+
 # ── a failing remote replay cleans up and fails loudly ───────────────────────
 : > "$SSH_LOG"
 if bash ./cov-analysis report --remote fuzzbox -d "$CORPUS" \
@@ -146,6 +178,64 @@ test -e "$TMP/report3" && die "a failed remote run must not publish a report"
 grep -q 'rm -rf' "$SSH_LOG" \
   || die "the remote working directory was not cleaned up after failure: $(cat "$SSH_LOG")"
 echo "[PASS] a failed remote replay cleans up and does not publish"
+
+mkdir -p "$TMP/slowcorpus"
+for i in $(seq 1 10); do printf 's%s' "$i" > "$TMP/slowcorpus/s$i"; done
+cat > "$TMP/slowtarget" <<'EOF'
+#!/bin/bash
+printf 'start\n' >> "$TRACE_FILE"
+sleep 2
+p="${LLVM_PROFILE_FILE//%p/$$}"
+mkdir -p "$(dirname "$p")"
+printf profile > "$p"
+EOF
+chmod +x "$TMP/slowtarget"
+export TRACE_FILE="$TMP/remote-trace"
+: > "$TRACE_FILE"
+set -m
+bash ./cov-analysis report --remote fuzzbox -d "$TMP/slowcorpus" \
+  -e "$TMP/slowtarget @@" --binary "$TMP/slowtarget" -o "$TMP/report7" \
+  --remote-dir "$TMP/remote" --queue-timeout 30 > "$TMP/interrupt.log" 2>&1 &
+JOB=$!
+set +m
+for i in $(seq 1 100); do
+  test -s "$TRACE_FILE" && break
+  sleep 0.1
+done
+test -s "$TRACE_FILE" || die "the remote replay never started: $(cat "$TMP/interrupt.log")"
+kill -INT -- -"$JOB"
+for i in $(seq 1 200); do
+  kill -0 "$JOB" 2>/dev/null || break
+  sleep 0.1
+done
+kill -0 "$JOB" 2>/dev/null && die "the local run kept running after Ctrl-C"
+wait "$JOB"
+rc=$?
+JOB=""
+test "$rc" -ne 0 || die "an interrupted remote run must not report success"
+started=$(grep -c . "$TRACE_FILE")
+sleep 3
+assert_eq "$(grep -c . "$TRACE_FILE")" "$started" \
+  "the remote replay kept starting inputs after Ctrl-C"
+test -e "$TMP/remote" && die "Ctrl-C left the remote working directory behind"
+test -e "$TMP/report7" && die "an interrupted remote run must not publish"
+echo "[PASS] Ctrl-C stops the remote replay and removes its working directory"
+
+: > "$TRACE_FILE"
+if SSH_DROP=1 bash ./cov-analysis report --remote fuzzbox -d "$TMP/slowcorpus" \
+     -e "$TMP/slowtarget @@" --binary "$TMP/slowtarget" -o "$TMP/report9" \
+     --remote-dir "$TMP/remote" --queue-timeout 30 > "$TMP/drop.log" 2>&1; then
+  die "a dropped connection must fail the run"
+fi
+test -s "$TRACE_FILE" || die "the remote replay never started: $(cat "$TMP/drop.log")"
+started=$(grep -c . "$TRACE_FILE")
+sleep 3
+assert_eq "$(grep -c . "$TRACE_FILE")" "$started" \
+  "the remote replay kept running after the connection dropped"
+test -e "$TMP/remote" && die "a dropped connection left the remote working directory behind"
+grep '^ssh' "$SSH_LOG" | grep -qF '[-o] [ConnectTimeout=15]' \
+  || die "the cleanup ssh must not wait for the TCP timeout: $(cat "$SSH_LOG")"
+echo "[PASS] a dropped connection stops the remote replay and removes its working directory"
 
 # ── argument checks ──────────────────────────────────────────────────────────
 if bash ./cov-analysis report --remote fuzzbox --profdata "$OUT/coverage.profdata" \

@@ -32,4 +32,18 @@ AFL_DIR="$TMP/honggfuzz"; mkfixture_honggfuzz "$AFL_DIR"
 FUZZER_LAYOUT="flat"
 find_queue_files | assert_count 2 "honggfuzz queue count"
 
+AFL_DIR="$TMP/flat-hidden"; mkfixture_libfuzzer "$AFL_DIR"
+: > "$AFL_DIR/.3f2a9c1d7e8b4a60.metadata"
+: > "$AFL_DIR/.3f2a9c1d7e8b4a60.lafl_lock"
+FUZZER_LAYOUT="flat"
+find_queue_files | assert_count 2 "flat queue count without hidden files"
+
+AFL_DIR="$TMP/libafl"; mkfixture_libafl "$AFL_DIR"
+FUZZER_LAYOUT="libafl"
+find_queue_files | assert_count 2 "libafl corpus count"
+
+AFL_DIR="$TMP/libafl-queue"; mkfixture_libafl_queue "$AFL_DIR"
+FUZZER_LAYOUT="libafl"
+find_queue_files | assert_count 3 "libafl queue count"
+
 echo "[PASS] find_queue_files"
