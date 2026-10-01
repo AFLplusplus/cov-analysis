@@ -309,28 +309,25 @@ a per-line marker column (`U` unreachable, `R` reachable-but-unreached,
 `A` anomaly), and `summary.txt` gains a reachability tally plus the explicit
 list of reachable-but-not-reached functions to go after.
 
-> **Matching mangling schemes join by exact name; a mismatch falls back to
-> `(file, line)`.** Build the reachability analysis with the same scheme the
-> coverage binary uses — fuzz-reachability's `--mangling` flag — and the
-> mangled names are identical on both sides, so the join above hits by exact
-> name/`key` directly: `--mangling legacy` for a legacy-mangled coverage
-> binary (the default for `cargo-afl`/`ziggy`/`cargo-fuzz` builds), or
-> `--mangling v0` for a `-Cinstrument-coverage` coverage binary (which always
-> forces Rust's **v0** `_R…` mangling). Rust name/key matching only
-> *tolerates drift* within the legacy scheme: the name/`key` join above
-> survives the legacy `17h<hash>` disambiguator differing between the
-> analyzed build and the coverage build. Under v0, fuzz-reachability's `key`
-> equals the raw mangled name — the normalization is inert for v0 — so a
-> scheme mismatch (e.g. a legacy-mangled analysis joined against a
-> v0-mangled coverage binary) or a v0 disambiguator that drifts between two
-> independently-built v0 binaries will not match by name or `key`. When the
+> **Matching mangling schemes join by name/`key`; a mismatch falls back to
+> `(file, line)`.** Build the reachability analysis with the scheme the
+> coverage binary uses — fuzz-reachability's `--mangling` flag: `--mangling v0`
+> for a `-Cinstrument-coverage` coverage binary (which always forces Rust's
+> **v0** `_R…` mangling), otherwise the toolchain's default (`--mangling
+> auto`; v0 on current rustc, legacy on older ones). Within one scheme the
+> name/`key` join tolerates the build-dependent tail of a Rust name: the legacy
+> `17h<hash>` disambiguator or the v0 instantiating crate, so a generic
+> instance that another crate compiled in the coverage build still matches. A
+> v0 name also contains each crate's disambiguator, which changes with the
+> cargo profile, the features and whether cargo gets `--target` (cargo-fuzz
+> always passes it), so build the analysis with the coverage build's profile
+> and `--target` setting. A scheme mismatch (e.g. a legacy-mangled analysis joined against a
+> v0-mangled coverage binary) never matches by name or `key`. When the
 > reachability report is the JSON report (not the `.txt` lists) and carries
 > `file`/`line` for the function (i.e. the analyzed bitcode has debug info),
 > the `(file, line)` fallback used above still classifies it correctly;
 > without debug info the function has no fallback and is left `unknown`. See
-> fuzz-reachability's README for the full explanation; full v0-aware key
-> normalization for the drifting-disambiguator case is a future enhancement
-> there, not yet implemented.
+> fuzz-reachability's README for the full explanation.
 
 **The coverage numbers themselves are recomputed to exclude unreachable
 functions.** Normally a function coverage of `5/6` counts a statically-dead

@@ -1,4 +1,5 @@
 # v1.3-dev
+- `--reachability`: a Rust v0 name is matched by fuzz-reachability's `key`, which ignores its trailing instantiating crate as it already ignored a legacy name's `17h<hash>` disambiguator, so a generic instance that another crate compiled still classifies
 - added --batch for better performance
 - fixed AFL++ directory, it is .../hangs not .../timeouts
 - more performance fixes

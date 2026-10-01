@@ -2734,14 +2734,251 @@ import sys
 from typing import Dict, Set, Tuple
 
 _RUST_DISAMBIG = re.compile(r'17h[0-9a-f]{16}E$')
+_V0_MAX_DEPTH = 256
+_V0_DIGITS = frozenset('0123456789')
+_V0_ALPHA = frozenset('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ')
+_V0_ALNUM = _V0_DIGITS | _V0_ALPHA
+_V0_HEX = frozenset('0123456789abcdef')
+_V0_PATH_TAGS = frozenset('CMXYNIB')
+
+
+class _V0Symbol:
+    def __init__(self, name):
+        self.s = name
+        self.pos = 0
+        self.depth = 0
+
+    def peek(self):
+        return self.s[self.pos] if self.pos < len(self.s) else ''
+
+    def eat(self, c):
+        if self.peek() != c:
+            return False
+        self.pos += 1
+        return True
+
+    def base62(self):
+        while self.peek() in _V0_ALNUM:
+            self.pos += 1
+        return self.eat('_')
+
+    def hex_data(self):
+        while self.peek() in _V0_HEX:
+            self.pos += 1
+        return self.eat('_')
+
+    def undisambiguated_identifier(self):
+        self.eat('u')
+        if self.peek() not in _V0_DIGITS:
+            return False
+        length = 0
+        if not self.eat('0'):
+            while self.peek() in _V0_DIGITS:
+                length = length * 10 + int(self.s[self.pos])
+                self.pos += 1
+                if length > len(self.s):
+                    return False
+        self.eat('_')
+        if length > len(self.s) - self.pos:
+            return False
+        self.pos += length
+        return True
+
+    def identifier(self):
+        if self.eat('s') and not self.base62():
+            return False
+        return self.undisambiguated_identifier()
+
+    def impl_path(self):
+        if self.eat('s') and not self.base62():
+            return False
+        return self.path()
+
+    def namespace(self):
+        if self.peek() not in _V0_ALPHA:
+            return False
+        self.pos += 1
+        return True
+
+    def path(self):
+        self.depth += 1
+        tag = self.peek()
+        ok = self.depth <= _V0_MAX_DEPTH and tag in _V0_PATH_TAGS
+        if ok:
+            self.pos += 1
+            if tag == 'C':
+                ok = self.identifier()
+            elif tag == 'M':
+                ok = self.impl_path() and self.type()
+            elif tag == 'X':
+                ok = self.impl_path() and self.type() and self.path()
+            elif tag == 'Y':
+                ok = self.type() and self.path()
+            elif tag == 'N':
+                ok = self.namespace() and self.path() and self.identifier()
+            elif tag == 'I':
+                ok = self.path()
+                while ok and not self.eat('E'):
+                    ok = self.generic_arg()
+            else:
+                ok = self.base62()
+        self.depth -= 1
+        return ok
+
+    def generic_arg(self):
+        if self.eat('L'):
+            return self.base62()
+        if self.eat('K'):
+            return self.constant()
+        return self.type()
+
+    def type(self):
+        self.depth += 1
+        tag = self.peek()
+        if self.depth > _V0_MAX_DEPTH:
+            ok = False
+        elif 'a' <= tag <= 'z':
+            self.pos += 1
+            ok = True
+        elif tag == 'A':
+            self.pos += 1
+            ok = self.type() and self.constant()
+        elif tag in ('S', 'P', 'O'):
+            self.pos += 1
+            ok = self.type()
+        elif tag == 'T':
+            self.pos += 1
+            ok = True
+            while ok and not self.eat('E'):
+                ok = self.type()
+        elif tag in ('R', 'Q'):
+            self.pos += 1
+            ok = (not self.eat('L') or self.base62()) and self.type()
+        elif tag == 'F':
+            self.pos += 1
+            ok = self.fn_sig()
+        elif tag == 'D':
+            self.pos += 1
+            ok = self.dyn_bounds() and self.eat('L') and self.base62()
+        elif tag == 'W':
+            self.pos += 1
+            ok = self.type() and self.pattern()
+        else:
+            ok = self.path()
+        self.depth -= 1
+        return ok
+
+    def fn_sig(self):
+        if self.eat('G') and not self.base62():
+            return False
+        self.eat('U')
+        if self.eat('K') and not self.eat('C') and not self.undisambiguated_identifier():
+            return False
+        while not self.eat('E'):
+            if not self.type():
+                return False
+        return self.type()
+
+    def dyn_bounds(self):
+        if self.eat('G') and not self.base62():
+            return False
+        while not self.eat('E'):
+            if not self.path():
+                return False
+            while self.eat('p'):
+                if not self.undisambiguated_identifier():
+                    return False
+                if not (self.constant() if self.eat('K') else self.type()):
+                    return False
+        return True
+
+    def pattern(self):
+        self.depth += 1
+        if self.depth > _V0_MAX_DEPTH:
+            ok = False
+        elif self.eat('R'):
+            ok = self.constant() and self.constant()
+        elif self.eat('O'):
+            ok = True
+            while ok and not self.eat('E'):
+                ok = self.pattern()
+        else:
+            ok = False
+        self.depth -= 1
+        return ok
+
+    def constant(self):
+        self.depth += 1
+        tag = self.peek()
+        ok = self.depth <= _V0_MAX_DEPTH and tag != ''
+        if ok:
+            self.pos += 1
+            if tag == 'p':
+                ok = True
+            elif tag == 'B':
+                ok = self.base62()
+            elif tag in 'aslxni':
+                self.eat('n')
+                ok = self.hex_data()
+            elif tag in 'htmyojbce':
+                ok = self.hex_data()
+            elif tag == 'R' and self.eat('e'):
+                ok = self.hex_data()
+            elif tag in 'RQ':
+                ok = self.constant()
+            elif tag in 'AT':
+                ok = True
+                while ok and not self.eat('E'):
+                    ok = self.constant()
+            elif tag == 'V':
+                ok = self.path() and self.const_fields()
+            else:
+                ok = False
+        self.depth -= 1
+        return ok
+
+    def const_fields(self):
+        if self.eat('U'):
+            return True
+        named = self.eat('S')
+        if not named and not self.eat('T'):
+            return False
+        while not self.eat('E'):
+            if named and not self.identifier():
+                return False
+            if not self.constant():
+                return False
+        return True
+
+    def instantiated_stem(self):
+        if not self.eat('_') or not self.eat('R'):
+            return None
+        while self.peek() in _V0_DIGITS:
+            self.pos += 1
+        if not self.path():
+            return None
+        stem = self.pos
+        if self.pos < len(self.s) and self.path() and self.pos == len(self.s):
+            return stem
+        return None
+
+
+def _v0_stem(name):
+    if not name.startswith('_R'):
+        return None
+    try:
+        return _V0Symbol(name).instantiated_stem()
+    except RecursionError:
+        return None
 
 
 def _reach_key(entry):
     if entry.endswith('*'):
         return entry[:-1]
-    if len(entry) > 20:
+    if len(entry) > 20 and _RUST_DISAMBIG.search(entry):
         return _RUST_DISAMBIG.sub('', entry)
-    return entry
+    stem = _v0_stem(entry)
+    return entry if stem is None else entry[:stem]
 
 
 def _reach_int(value):

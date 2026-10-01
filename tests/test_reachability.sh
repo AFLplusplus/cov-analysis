@@ -984,6 +984,33 @@ PYEOF
 } | python3 - || die "M1: _reach_key must leave a bare 17h<16hex>E string unchanged"
 echo "[PASS] M1: _reach_key guards len(entry)>20 like C++ legacyStem"
 
+{ reach_py_lib; cat << 'PYEOF'
+stem = '_RINvCs5zheXYwTW8r_3dep8checksumhE'
+assert _reach_key(stem + 'Cse69bWBSeLps_21rust_upstream_generic') == stem
+assert _reach_key(stem + 'B2_') == stem
+assert _reach_key(stem + '*') == stem
+nested = '_RNvMs5_NtCsi5OtIxrel2u_5alloc7raw_vecNtB5_11RawVecInner16with_capacity_in'
+assert _reach_key(nested + 'Cse69bWBSeLps_21rust_upstream_generic') == nested
+for exact in ('_RNvCs5zheXYwTW8r_3dep12dep_checksum', stem + 'B2_.cold',
+              '_RINvCs1a2b3c4d5e6f_3app4workE', '_Rprivate_helper', '_R'):
+    assert _reach_key(exact) == exact, exact
+PYEOF
+} | python3 - || die "M2: _reach_key must strip a v0 instantiating crate and leave other names unchanged"
+echo "[PASS] M2: _reach_key strips the v0 instantiating crate like C++ canonicalKey"
+
+{ reach_py_lib; cat << 'PYEOF'
+for inner, stripped in (('FE' * 254 + 'u', True), ('FE' * 300 + 'u', False),
+                        ('DINvC3foo1S' * 126 + 'u' + 'EEL_' * 126, True),
+                        ('K' + 'A' * 255 + 'E' * 255, True)):
+    name = '_RINvC3foo3bar' + inner + 'EB2_'
+    stem = _V0Symbol(name).instantiated_stem()
+    assert (stem == len(name) - 3) is stripped, (inner[:12], stem)
+for name in ('_RC²x', '_RNvC3foo¹abcB2_', '_RNvC٣fooC3bar'):
+    assert _reach_key(name) == name, ascii(name)
+PYEOF
+} | python3 - || die "M3: _reach_key must parse v0 names up to the C++ depth limit and reject non-ASCII digits"
+echo "[PASS] M3: _reach_key handles deep and non-ASCII v0 names like C++ canonicalKey"
+
 # ── clang-gated end-to-end against REAL llvm-cov output ──────────────────────
 CLANG="$(detect_clang || true)"
 COVTOOL=""

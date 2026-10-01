@@ -3,8 +3,9 @@
 # static analysis of a real Rust staticlib, cross-referenced against a real
 # `-Cinstrument-coverage` build replayed through llvm-cov, via cov-analysis's
 # own `report --reachability`. No synthetic JSON/HTML fixtures here — every
-# input is produced by the real toolchains, so the join between the two tools'
-# independently-mangled symbol names cannot rely on a lucky exact match.
+# input is produced by the real toolchains. The analysis runs once with legacy
+# mangling, whose names share nothing with the v0 coverage build, so that join
+# cannot rely on a lucky exact match, and once with v0, the toolchain default.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
@@ -56,54 +57,64 @@ PYEOF
 DEAD_LINE=$(grep -n '^pub extern "C" fn dead_fn' "$WORK/src/lib.rs" | head -n1 | cut -d: -f1)
 [ -n "$DEAD_LINE" ] || die "could not locate injected dead_fn line"
 
-# ── stage 1: static reachability analysis of the (unbuilt) staticlib ────────
-if ! REACHABILITY_ANALYZER="$ANALYZER" \
-  "$REACH_CLI" run --lang rust --project "$WORK" --entry LLVMFuzzerTestOneInput \
-  --out "$WORK/reach.json" > "$TMP/reach_run.log" 2>&1; then
-  if grep -qiE 'bundled LLVM|bitcode cannot be read|LLVM_MAJOR' "$TMP/reach_run.log"; then
-    echo "[SKIP] reachability analyzer/rustc LLVM toolchain mismatch: $(tail -n1 "$TMP/reach_run.log")"
-    exit 0
+# ── stage 1: static reachability analysis of the (unbuilt) staticlib, under
+# legacy mangling (forced, or the toolchain default) and under v0 ───────────
+reach_run() {
+  mkdir -p "$WORK/reach-$1"
+  REACHABILITY_ANALYZER="$ANALYZER" \
+    "$REACH_CLI" run --lang rust --project "$WORK" --entry LLVMFuzzerTestOneInput \
+    --mangling "$2" --out "$WORK/reach-$1/reach.json" > "$TMP/reach_run.log" 2>&1
+}
+reach_scheme() {
+  python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['mangling'])" "$1"
+}
+SCHEMES=""
+for scheme in legacy v0; do
+  if ! reach_run "$scheme" "$scheme"; then
+    if grep -qiE 'bundled LLVM|bitcode cannot be read|LLVM_MAJOR' "$TMP/reach_run.log"; then
+      echo "[SKIP] reachability analyzer/rustc LLVM toolchain mismatch: $(tail -n1 "$TMP/reach_run.log")"
+      exit 0
+    fi
+    [ "$scheme" = legacy ] && grep -q 'only accepted on the nightly compiler' "$TMP/reach_run.log" \
+      || die "reachability run failed ($scheme): $(cat "$TMP/reach_run.log")"
+    reach_run legacy auto || die "reachability run failed (auto): $(cat "$TMP/reach_run.log")"
+    if [ "$(reach_scheme "$WORK/reach-legacy/reach.json")" != legacy ]; then
+      echo "[SKIP] legacy scheme: rustc defaults to v0 and only a nightly rustc can force legacy"
+      continue
+    fi
   fi
-  die "reachability run failed: $(cat "$TMP/reach_run.log")"
-fi
-[ -f "$WORK/reach.json" ]         || die "reach.json was not produced"
-[ -f "$WORK/reached.txt" ]        || die "reached.txt was not produced"
-[ -f "$WORK/not_reached.txt" ]    || die "not_reached.txt was not produced"
+  OUT="$WORK/reach-$scheme"
+  [ -f "$OUT/reach.json" ]         || die "$scheme: reach.json was not produced"
+  [ -f "$OUT/reached.txt" ]        || die "$scheme: reached.txt was not produced"
+  [ -f "$OUT/not_reached.txt" ]    || die "$scheme: not_reached.txt was not produced"
+  assert_eq "$(reach_scheme "$OUT/reach.json")" "$scheme" "reach.json mangling"
 
-read -r N_DEFINED N_REACHABLE N_UNREACHABLE < <(python3 -c "
+  read -r N_DEFINED N_REACHABLE N_UNREACHABLE < <(python3 -c "
 import json
-d = json.load(open('$WORK/reach.json'))
+d = json.load(open('$OUT/reach.json'))
 s = d['summary']
 print(s['defined'], s['reachable'], s['unreachable'])
 ")
-assert_eq "$N_DEFINED" "6" "reach.json summary.defined"
-assert_eq "$N_REACHABLE" "5" "reach.json summary.reachable"
-assert_eq "$N_UNREACHABLE" "1" "reach.json summary.unreachable"
-grep -q 'fun:LLVMFuzzerTestOneInput' "$WORK/reached.txt"     || die "reached.txt missing LLVMFuzzerTestOneInput"
-grep -q 'fun:dead_fn' "$WORK/not_reached.txt"                || die "not_reached.txt missing dead_fn"
-echo "[PASS] stage 1: static reachability analysis (defined=6 reachable=5 unreachable=1)"
+  assert_eq "$N_DEFINED" "6" "$scheme: reach.json summary.defined"
+  assert_eq "$N_REACHABLE" "5" "$scheme: reach.json summary.reachable"
+  assert_eq "$N_UNREACHABLE" "1" "$scheme: reach.json summary.unreachable"
+  grep -q 'fun:LLVMFuzzerTestOneInput' "$OUT/reached.txt"     || die "$scheme: reached.txt missing LLVMFuzzerTestOneInput"
+  grep -q 'fun:dead_fn' "$OUT/not_reached.txt"                || die "$scheme: not_reached.txt missing dead_fn"
+  SCHEMES="$SCHEMES $scheme"
+  echo "[PASS] stage 1 ($scheme): static reachability analysis (defined=6 reachable=5 unreachable=1)"
+done
 
 # ── stage 2: real llvm source-based coverage build of the SAME crate ────────
 # `-C instrument-coverage` implies `-C symbol-mangling-version=v0`, so the
 # `work::<u32|u64>` monomorphizations get mangled names that share no
-# substring with the legacy (`17h<hash>E`-suffixed) names the reachability
-# analysis above just recorded -- the join below cannot be an accidental
-# exact-name match.
+# substring with the legacy (`17h<hash>E`-suffixed) names of the legacy
+# analysis above -- that join cannot be an accidental exact-name match.
 ( cd "$WORK" && FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION=1 \
     RUSTFLAGS="-Cinstrument-coverage" cargo build > "$TMP/cargo_build.log" 2>&1 ) \
   || die "coverage cargo build failed: $(cat "$TMP/cargo_build.log")"
 [ -f "$WORK/target/debug/librust_generic.a" ] || die "librust_generic.a was not built"
 
-REACH_MANGLED_WORK="$(python3 -c "
-import json
-d = json.load(open('$WORK/reach.json'))
-print(next(f['mangled'] for f in d['reachable'] if 'work' in f['mangled']))
-")"
-case "$REACH_MANGLED_WORK" in
-  _ZN*17h*E) : ;;
-  *) die "expected a legacy-mangled 'work' symbol in reach.json, got: $REACH_MANGLED_WORK" ;;
-esac
-echo "[PASS] stage 2: coverage-instrumented build compiled (legacy-mangled reach.json vs v0-forced coverage binary)"
+echo "[PASS] stage 2: coverage-instrumented build compiled (v0-forced coverage binary)"
 
 # ── stage 3: emit + link the cov-analysis replay driver against the staticlib
 bash "$COV" driver -o "$WORK/coverage_driver.c" >/dev/null
@@ -117,55 +128,72 @@ LLVM_PROFILE_FILE="$TMP/printsignature.profraw" "$WORK/cov" --printsignature \
   || die "cov binary does not carry the cov-analysis driver signature"
 echo "[PASS] stage 3: coverage_driver.c linked against the Rust staticlib"
 
-# ── stage 4: replay one input and let cov-analysis drive llvm-cov + annotate
+# ── stage 4: replay one input and let cov-analysis drive llvm-cov + annotate,
+# once per analysis from stage 1 ─────────────────────────────────────────────
 mkdir -p "$WORK/corpus"
 printf '\x05' > "$WORK/corpus/seed1"
-bash "$COV" report -d "$WORK/corpus" -e "$WORK/cov @@" \
-  --reachability "$WORK/reach.json" -o "$WORK/covout" > "$TMP/report.log" 2>&1 \
-  || die "cov-analysis report failed: $(cat "$TMP/report.log")"
-[ -f "$WORK/covout/coverage.json" ] || die "covout/coverage.json was not produced"
-
-COV_NAME_WORK="$(python3 -c "
+for scheme in $SCHEMES; do
+  REACH="$WORK/reach-$scheme/reach.json"
+  COVOUT="$WORK/covout-$scheme"
+  REACH_MANGLED_WORK="$(python3 -c "
 import json
-d = json.load(open('$WORK/covout/coverage.json'))
+d = json.load(open('$REACH'))
+print(next(f['mangled'] for f in d['reachable'] if 'work' in f['mangled']))
+")"
+  case "$scheme:$REACH_MANGLED_WORK" in
+    legacy:_ZN*17h*E | v0:_R*) : ;;
+    *) die "expected a $scheme-mangled 'work' symbol in $REACH, got: $REACH_MANGLED_WORK" ;;
+  esac
+  bash "$COV" report -d "$WORK/corpus" -e "$WORK/cov @@" \
+    --reachability "$REACH" -o "$COVOUT" > "$TMP/report.log" 2>&1 \
+    || die "$scheme: cov-analysis report failed: $(cat "$TMP/report.log")"
+  [ -f "$COVOUT/coverage.json" ] || die "$scheme: coverage.json was not produced"
+
+  COV_NAME_WORK="$(python3 -c "
+import json
+d = json.load(open('$COVOUT/coverage.json'))
 names = [fn['name'] for obj in d['data'] for fn in obj['functions'] if 'work' in fn['name']]
 print(names[0] if names else '')
 ")"
-[ -n "$COV_NAME_WORK" ] || die "no 'work' function found in covout/coverage.json"
-[ "$COV_NAME_WORK" != "$REACH_MANGLED_WORK" ] \
-  || die "test setup bug: coverage and reachability 'work' names should differ (v0 vs legacy mangling)"
-echo "[PASS] stage 4: cov-analysis report ran real llvm-cov (mismatched names confirmed: $REACH_MANGLED_WORK vs $COV_NAME_WORK)"
+  [ -n "$COV_NAME_WORK" ] || die "$scheme: no 'work' function found in coverage.json"
+  if [ "$scheme" = legacy ]; then
+    [ "$COV_NAME_WORK" != "$REACH_MANGLED_WORK" ] \
+      || die "test setup bug: coverage and reachability 'work' names should differ (v0 vs legacy mangling)"
+  fi
+  echo "[PASS] stage 4 ($scheme): cov-analysis report ran real llvm-cov ($REACH_MANGLED_WORK vs $COV_NAME_WORK)"
 
-# ── stage 5: HTML/summary assertions -- the mismatched-mangling generics
-# still classify covered/reachable-unreached (never unknown); the injected
-# dead function classifies unreachable ────────────────────────────────────
-HFILE="$(find "$WORK/covout/html/coverage" -name 'lib.rs.html')"
-[ -n "$HFILE" ] || die "no lib.rs.html found under covout/html/coverage"
-for ln in "$DEAD_LINE" "$((DEAD_LINE + 1))" "$((DEAD_LINE + 2))"; do
-  grep -q "reach-grey'><td class='line-number'><a name='L$ln'" "$HFILE" \
-    || die "html: dead_fn line $ln should get class reach-grey"
+  # ── stage 5: HTML/summary assertions -- the generics classify
+  # covered/reachable-unreached (never unknown) under either scheme, the legacy
+  # one despite its mismatched names; the injected dead function classifies
+  # unreachable ─────────────────────────────────────────────────────────────
+  HFILE="$(find "$COVOUT/html/coverage" -name 'lib.rs.html')"
+  [ -n "$HFILE" ] || die "$scheme: no lib.rs.html found under html/coverage"
+  for ln in "$DEAD_LINE" "$((DEAD_LINE + 1))" "$((DEAD_LINE + 2))"; do
+    grep -q "reach-grey'><td class='line-number'><a name='L$ln'" "$HFILE" \
+      || die "$scheme: html: dead_fn line $ln should get class reach-grey"
+  done
+  echo "[PASS] stage 5 ($scheme): html tints the injected dead_fn reach-grey (unreachable)"
+
+  N_REACH_CLASSES="$(grep -o "class='reach-[a-z-]*'" "$HFILE" | wc -l)"
+  assert_eq "$N_REACH_CLASSES" "3" "$scheme: html: only the 3 dead_fn lines should carry a reach-* class (work/LLVMFuzzerTestOneInput must stay untouched, i.e. classified covered, not unknown)"
+  echo "[PASS] stage 5 ($scheme): reachable work/LLVMFuzzerTestOneInput lines are untouched (covered, not unknown/unreachable)"
+
+  grep -qi 'reachab' "$COVOUT/html/index.html" || die "$scheme: index.html should gain a reachability banner"
+  grep -q ': 3 reachable' "$COVOUT/html/index.html" \
+    || die "$scheme: index.html banner should report 3 reachable functions (present in coverage: entry + 2 work instances)"
+  grep -q '1 unreachable' "$COVOUT/html/index.html" \
+    || die "$scheme: index.html banner should report 1 unreachable function (dead_fn)"
+  echo "[PASS] stage 5 ($scheme): index.html banner reports the correct reachable/unreachable tally"
+
+  grep -Eq '^ *reachable functions +: 3$' "$COVOUT/summary.txt" \
+    || die "$scheme: summary.txt should count 3 reachable functions"
+  grep -Eq 'unreachable functions +: 1' "$COVOUT/summary.txt" \
+    || die "$scheme: summary.txt should count 1 unreachable function"
+  grep -qi 'Reachable-only coverage' "$COVOUT/summary.txt" \
+    || die "$scheme: summary.txt should carry the reachable-only recomputed table"
+  grep -q 'excludes 1 statically-unreachable function' "$COVOUT/summary.txt" \
+    || die "$scheme: summary.txt should note dead_fn was excluded from the reachable-only numbers"
+  echo "[PASS] stage 5 ($scheme): summary.txt reachability tally + reachable-only table"
 done
-echo "[PASS] stage 5: html tints the injected dead_fn reach-grey (unreachable)"
-
-N_REACH_CLASSES="$(grep -o "class='reach-[a-z-]*'" "$HFILE" | wc -l)"
-assert_eq "$N_REACH_CLASSES" "3" "html: only the 3 dead_fn lines should carry a reach-* class (work/LLVMFuzzerTestOneInput must stay untouched, i.e. classified covered, not unknown)"
-echo "[PASS] stage 5: reachable work/LLVMFuzzerTestOneInput lines are untouched (covered, not unknown/unreachable)"
-
-grep -qi 'reachab' "$WORK/covout/html/index.html" || die "index.html should gain a reachability banner"
-grep -q ': 3 reachable' "$WORK/covout/html/index.html" \
-  || die "index.html banner should report 3 reachable functions (present in coverage: entry + 2 work instances)"
-grep -q '1 unreachable' "$WORK/covout/html/index.html" \
-  || die "index.html banner should report 1 unreachable function (dead_fn)"
-echo "[PASS] stage 5: index.html banner reports the correct reachable/unreachable tally"
-
-grep -Eq '^ *reachable functions +: 3$' "$WORK/covout/summary.txt" \
-  || die "summary.txt should count 3 reachable functions"
-grep -Eq 'unreachable functions +: 1' "$WORK/covout/summary.txt" \
-  || die "summary.txt should count 1 unreachable function"
-grep -qi 'Reachable-only coverage' "$WORK/covout/summary.txt" \
-  || die "summary.txt should carry the reachable-only recomputed table"
-grep -q 'excludes 1 statically-unreachable function' "$WORK/covout/summary.txt" \
-  || die "summary.txt should note dead_fn was excluded from the reachable-only numbers"
-echo "[PASS] stage 5: summary.txt reachability tally + reachable-only table"
 
 echo "[PASS] test_reachability_rust_e2e"
